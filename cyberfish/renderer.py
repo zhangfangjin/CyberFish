@@ -198,8 +198,17 @@ class AquariumRenderer:
         selected_peer: Peer | None,
     ) -> None:
         width, _height = self.screen.get_size()
+        online_peer_ids = {peer.node_id for peer in peers}
+
+        def topology_label(direction: str) -> str:
+            peer_id = config.topology.get(direction)
+            if not peer_id:
+                return "-"
+            marker = "*" if peer_id in online_peer_ids else "?"
+            return f"{peer_id[:8]}{marker}"
+
         topology = " ".join(
-            f"{direction[0].upper()}:{(config.topology.get(direction) or '-')[:8]}"
+            f"{direction[0].upper()}:{topology_label(direction)}"
             for direction in ("left", "right", "up", "down")
         )
         lines = [

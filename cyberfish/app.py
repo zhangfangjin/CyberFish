@@ -7,7 +7,13 @@ import time
 import pygame
 
 from .audio import AudioController
-from .config import AppConfig, DIRECTIONS, load_config, save_config
+from .config import (
+    AppConfig,
+    DIRECTIONS,
+    assign_peer_to_single_direction,
+    load_config,
+    save_config,
+)
 from .fish import Fish, create_random_fish
 from .network import NetworkManager, Peer
 from .renderer import AquariumRenderer
@@ -212,7 +218,7 @@ class CyberFishApp:
         }
         direction = direction_by_key.get(key)
         if direction in DIRECTIONS:
-            self.config.topology[direction] = peer.node_id
+            assign_peer_to_single_direction(self.config.topology, peer.node_id, direction)
             save_config(self.config_path, self.config)
 
     def _network_tick(self, now: float) -> None:
@@ -251,18 +257,43 @@ class CyberFishApp:
 
     def _update_fishes(self, dt: float) -> None:
         bounds = self._bounds()
+        open_edges = self._transfer_ready_edges()
         remaining: list[Fish] = []
         for fish in self.fishes:
-            fish.update(dt, self.fishes, bounds, self.rng, self.config.speed_multiplier)
-            direction = fish.crossed_edge(bounds)
-            if direction and self._try_transfer_fish(fish, direction):
+            fish.update(
+                dt,
+                self.fishes,
+                bounds,
+                self.rng,
+                self.config.speed_multiplier,
+                open_edges=open_edges,
+            )
+            transfer_direction = fish.crossed_edge(
+                bounds,
+                margin_scale=0.12,
+                only_edges=open_edges,
+            )
+            if transfer_direction and self._try_transfer_fish(fish, transfer_direction):
                 if self.renderer:
                     self.renderer.add_ripple(fish.position, fish.body_length)
                 continue
+            if transfer_direction:
+                fish.bounce_inside(bounds)
+
+            direction = fish.crossed_edge(bounds)
             if direction:
                 fish.bounce_inside(bounds)
             remaining.append(fish)
         self.fishes = remaining
+
+    def _transfer_ready_edges(self) -> set[str]:
+        if not self.config.network_enabled or not self.network:
+            return set()
+        return {
+            direction
+            for direction, peer_id in self.config.topology.items()
+            if direction in DIRECTIONS and self.network.get_peer(peer_id) is not None
+        }
 
     def _try_transfer_fish(self, fish: Fish, direction: str) -> bool:
         if not self.config.network_enabled or not self.network:

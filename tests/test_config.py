@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cyberfish.config import DIRECTIONS, AppConfig, load_config, save_config
+from cyberfish.config import (
+    DIRECTIONS,
+    AppConfig,
+    assign_peer_to_single_direction,
+    load_config,
+    save_config,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -25,6 +31,18 @@ class ConfigTests(unittest.TestCase):
             loaded = load_config(path)
             self.assertEqual(loaded.node_id, "node-a")
             self.assertEqual(loaded.topology["right"], "node-b")
+
+    def test_peer_can_only_be_assigned_to_one_direction(self) -> None:
+        config = AppConfig(node_id="node-a")
+        assign_peer_to_single_direction(config.topology, "node-b", "right")
+        assign_peer_to_single_direction(config.topology, "node-b", "up")
+
+        self.assertIsNone(config.topology["right"])
+        self.assertEqual(config.topology["up"], "node-b")
+        self.assertEqual(
+            sum(1 for peer_id in config.topology.values() if peer_id == "node-b"),
+            1,
+        )
 
 
 if __name__ == "__main__":

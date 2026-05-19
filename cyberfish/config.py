@@ -84,3 +84,18 @@ def save_config(path: Path, config: AppConfig) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config.normalized().to_dict(), handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+
+
+def assign_peer_to_single_direction(
+    topology: dict[str, str | None],
+    peer_id: str,
+    direction: str,
+) -> dict[str, str | None]:
+    """Assign a peer to exactly one topology direction."""
+    if direction not in DIRECTIONS:
+        raise ValueError(f"Invalid topology direction: {direction}")
+    for existing_direction in DIRECTIONS:
+        if topology.get(existing_direction) == peer_id:
+            topology[existing_direction] = None
+    topology[direction] = peer_id
+    return topology

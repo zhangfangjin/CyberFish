@@ -16,6 +16,32 @@ class FishTests(unittest.TestCase):
         fish.update(0.2, [fish], (800, 600), rng)
         self.assertNotEqual(start, fish.position)
 
+    def test_open_edge_allows_fish_to_swim_outward(self) -> None:
+        closed_rng = random.Random(4)
+        open_rng = random.Random(4)
+        closed_fish = Fish(
+            fish_id="closed",
+            position=pygame.Vector2(780, 300),
+            velocity=pygame.Vector2(100, 0),
+            size=60,
+            color=(255, 100, 80),
+            depth=0.5,
+        )
+        open_fish = Fish(
+            fish_id="open",
+            position=pygame.Vector2(780, 300),
+            velocity=pygame.Vector2(100, 0),
+            size=60,
+            color=(255, 100, 80),
+            depth=0.5,
+        )
+
+        closed_fish.update(1.0, [closed_fish], (800, 600), closed_rng)
+        open_fish.update(1.0, [open_fish], (800, 600), open_rng, open_edges={"right"})
+
+        self.assertGreater(open_fish.position.x, closed_fish.position.x)
+        self.assertGreater(open_fish.velocity.x, 0)
+
     def test_edge_detection_and_bounce(self) -> None:
         fish = Fish(
             fish_id="f1",
@@ -46,6 +72,22 @@ class FishTests(unittest.TestCase):
         self.assertLess(incoming.position.x, 0)
         self.assertAlmostEqual(incoming.position.y, 384, delta=1.0)
         self.assertGreater(incoming.velocity.x, 0)
+
+    def test_open_edge_transfer_can_trigger_soon_after_boundary_cross(self) -> None:
+        fish = Fish(
+            fish_id="f2",
+            position=pygame.Vector2(812, 300),
+            velocity=pygame.Vector2(120, 0),
+            size=50,
+            color=(1, 2, 3),
+            depth=0.7,
+        )
+
+        self.assertIsNone(fish.crossed_edge((800, 600)))
+        self.assertEqual(
+            fish.crossed_edge((800, 600), margin_scale=0.12, only_edges={"right"}),
+            "right",
+        )
 
 
 if __name__ == "__main__":

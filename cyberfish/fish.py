@@ -73,10 +73,12 @@ class Fish:
         bounds: tuple[int, int],
         rng: random.Random,
         speed_multiplier: float = 1.0,
+        open_edges: set[str] | None = None,
     ) -> None:
         if dt <= 0:
             return
 
+        open_edges = open_edges or set()
         width, height = bounds
         desired = Vector2()
         separation = Vector2()
@@ -110,13 +112,13 @@ class Fish:
             desired += separation * 42.0
 
         margin = 110.0 * self.scale
-        if self.position.x < margin:
+        if self.position.x < margin and "left" not in open_edges:
             desired.x += (margin - self.position.x) * 1.7
-        elif self.position.x > width - margin:
+        elif self.position.x > width - margin and "right" not in open_edges:
             desired.x -= (self.position.x - (width - margin)) * 1.7
-        if self.position.y < margin:
+        if self.position.y < margin and "up" not in open_edges:
             desired.y += (margin - self.position.y) * 1.7
-        elif self.position.y > height - margin:
+        elif self.position.y > height - margin and "down" not in open_edges:
             desired.y -= (self.position.y - (height - margin)) * 1.7
 
         angle = math.atan2(self.velocity.y, self.velocity.x)
@@ -138,16 +140,22 @@ class Fish:
         self.phase = (self.phase + dt * (5.5 + self.velocity.length() / 32.0)) % (math.tau)
         self.age += dt
 
-    def crossed_edge(self, bounds: tuple[int, int]) -> str | None:
+    def crossed_edge(
+        self,
+        bounds: tuple[int, int],
+        *,
+        margin_scale: float = 0.7,
+        only_edges: set[str] | None = None,
+    ) -> str | None:
         width, height = bounds
-        margin = self.body_length * 0.7
-        if self.position.x < -margin:
+        margin = self.body_length * margin_scale
+        if self.position.x < -margin and (only_edges is None or "left" in only_edges):
             return "left"
-        if self.position.x > width + margin:
+        if self.position.x > width + margin and (only_edges is None or "right" in only_edges):
             return "right"
-        if self.position.y < -margin:
+        if self.position.y < -margin and (only_edges is None or "up" in only_edges):
             return "up"
-        if self.position.y > height + margin:
+        if self.position.y > height + margin and (only_edges is None or "down" in only_edges):
             return "down"
         return None
 
