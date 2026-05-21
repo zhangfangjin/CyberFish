@@ -14,6 +14,7 @@ from .config import (
     load_config,
     save_config,
 )
+from .controls import ControlAction
 from .fish import Fish, create_random_fish
 from .network import NetworkManager, Peer
 from .renderer import AquariumRenderer
@@ -38,7 +39,6 @@ class CyberFishApp:
         self.network: NetworkManager | None = None
         self.fishes: list[Fish] = []
         self.paused = False
-        self.calibration = False
         self.selected_peer_index = 0
         self.running = False
         self._last_hello_at = 0.0
@@ -54,6 +54,7 @@ class CyberFishApp:
         self.audio.start()
         self._reset_fishes()
         self._start_network()
+        self._render(0.0)
 
         self.running = True
         started_at = time.monotonic()
@@ -72,15 +73,38 @@ class CyberFishApp:
             self._shutdown()
 
     def _create_screen(self) -> pygame.Surface:
-        flags = pygame.SCALED | pygame.RESIZABLE
         size = (self.config.window_width, self.config.window_height)
         if self.config.fullscreen:
-            flags = pygame.FULLSCREEN | pygame.SCALED
             sizes = pygame.display.get_desktop_sizes()
             if sizes:
                 index = min(self.config.display_index, len(sizes) - 1)
                 size = sizes[index]
-        return pygame.display.set_mode(size, flags, display=self.config.display_index)
+        return self._set_display_mode(size, fullscreen=self.config.fullscreen)
+
+    def _set_display_mode(
+        self,
+        size: tuple[int, int],
+        *,
+        fullscreen: bool,
+    ) -> pygame.Surface:
+        width, height = size
+        size = (max(320, int(width)), max(240, int(height)))
+        flags = pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE
+
+        try:
+            return pygame.display.set_mode(
+                size,
+                flags,
+                display=self.config.display_index,
+            )
+        except pygame.error as exc:
+            last_error: pygame.error = exc
+        if self.config.display_index != 0:
+            try:
+                return pygame.display.set_mode(size, flags, display=0)
+            except pygame.error as exc:
+                last_error = exc
+        raise last_error
 
     def _start_network(self) -> None:
         if not self.config.network_enabled:
@@ -122,6 +146,8 @@ class CyberFishApp:
                 self.running = False
             elif event.type == pygame.VIDEORESIZE:
                 self._handle_resize(event.size)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                self._handle_mouse_click(event.pos)
             elif event.type == pygame.KEYDOWN:
                 self._handle_keydown(event)
 
@@ -130,49 +156,102 @@ class CyberFishApp:
             return
         self.config.window_width, self.config.window_height = size
         if self.screen and self.renderer:
-            self.screen = pygame.display.set_mode(size, pygame.SCALED | pygame.RESIZABLE)
+            self.screen = self._set_display_mode(size, fullscreen=False)
             self.renderer.resize(self.screen)
         if self.network:
             self.network.update_screen_size(size)
 
     def _handle_keydown(self, event: pygame.event.Event) -> None:
-        key = event.key
-        if key == pygame.K_ESCAPE:
+        if event.key == pygame.K_ESCAPE:
             self.running = False
-        elif key == pygame.K_SPACE:
+
+    def _handle_mouse_click(self, position: tuple[int, int]) -> None:
+        if not self.renderer:
+            return
+        for click_position in self._console_click_positions(position):
+            action = self.renderer.handle_console_click(click_position)
+            if action:
+                self._handle_console_action(action)
+                return
+
+    def _console_click_positions(self, position: tuple[int, int]) -> list[tuple[int, int]]:
+        candidates: list[tuple[int, int]] = []
+
+        def add(point: tuple[int, int]) -> None:
+            normalized = (int(round(point[0])), int(round(point[1])))
+            if normalized not in candidates:
+                candidates.append(normalized)
+
+        add((int(position[0]), int(position[1])))
+        if not self.screen:
+            return candidates
+
+        surface_width, surface_height = self.screen.get_size()
+        if surface_width <= 0 or surface_height <= 0:
+            return candidates
+
+        try:
+            window_width, window_height = pygame.display.get_window_size()
+        except pygame.error:
+            window_width = window_height = 0
+
+        if window_width > 0 and window_height > 0 and (
+            (surface_width, surface_height) != (window_width, window_height)
+        ):
+            add((position[0] * surface_width / window_width, position[1] * surface_height / window_height))
+            add((position[0] * window_width / surface_width, position[1] * window_height / surface_height))
+
+        # Retina / HiDPI 兜底：鼠标事件可能落在物理像素坐标，按比例尝试 0.5 / 2.0 缩放。
+        for ratio in (0.5, 2.0):
+            add((position[0] * ratio, position[1] * ratio))
+
+        return candidates
+
+    def _handle_console_action(self, action: ControlAction) -> None:
+        if action.name == "toggle_pause":
             self.paused = not self.paused
-        elif key == pygame.K_r:
+        elif action.name == "reset":
             self._reset_fishes()
-        elif key == pygame.K_l:
+        elif action.name == "quit":
+            self.running = False
+        elif action.name == "toggle_network":
             self._toggle_network()
-        elif key == pygame.K_m:
+        elif action.name == "toggle_sound":
             self.config.sound_enabled = not self.config.sound_enabled
             self.audio.set_enabled(self.config.sound_enabled)
             save_config(self.config_path, self.config)
-        elif key == pygame.K_F11:
+        elif action.name == "toggle_fullscreen":
             self._toggle_fullscreen()
-        elif key == pygame.K_c:
-            self.calibration = not self.calibration
-        elif key == pygame.K_TAB:
-            self._select_next_peer()
-        elif key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
-            if event.mod & pygame.KMOD_SHIFT:
-                self._assign_selected_peer_to_direction(key)
-        elif key in (pygame.K_EQUALS, pygame.K_PLUS):
-            self.config.speed_multiplier = min(4.0, self.config.speed_multiplier + 0.1)
-            save_config(self.config_path, self.config)
-        elif key == pygame.K_MINUS:
-            self.config.speed_multiplier = max(0.1, self.config.speed_multiplier - 0.1)
-            save_config(self.config_path, self.config)
-        elif key == pygame.K_RIGHTBRACKET:
-            self.config.fish_count = min(200, self.config.fish_count + 1)
+        elif action.name == "fish_inc":
+            self._change_fish_count(1)
+        elif action.name == "fish_dec":
+            self._change_fish_count(-1)
+        elif action.name == "speed_inc":
+            self._change_speed(0.1)
+        elif action.name == "speed_dec":
+            self._change_speed(-0.1)
+        elif action.name == "select_peer":
+            self._select_peer_by_index(action.value)
+        elif action.name == "assign_direction":
+            self._assign_selected_peer_to_direction(action.value)
+
+    def _change_fish_count(self, delta: int) -> None:
+        target = min(200, max(1, self.config.fish_count + delta))
+        if target == self.config.fish_count:
+            return
+        self.config.fish_count = target
+        while len(self.fishes) < target:
             self.fishes.append(create_random_fish(self._bounds(), self.rng, self.config.speed_multiplier))
-            save_config(self.config_path, self.config)
-        elif key == pygame.K_LEFTBRACKET:
-            self.config.fish_count = max(1, self.config.fish_count - 1)
-            if len(self.fishes) > self.config.fish_count:
-                self.fishes.pop()
-            save_config(self.config_path, self.config)
+        while len(self.fishes) > target:
+            self.fishes.pop()
+        save_config(self.config_path, self.config)
+
+    def _change_speed(self, delta: float) -> None:
+        self.config.speed_multiplier = round(
+            min(4.0, max(0.1, self.config.speed_multiplier + delta)),
+            1,
+        )
+        save_config(self.config_path, self.config)
 
     def _toggle_network(self) -> None:
         self.config.network_enabled = not self.config.network_enabled
@@ -192,12 +271,15 @@ class CyberFishApp:
             self.network.update_screen_size(self._bounds())
         save_config(self.config_path, self.config)
 
-    def _select_next_peer(self) -> None:
+    def _select_peer_by_index(self, index: object) -> None:
         peers = self._peers()
         if not peers:
             self.selected_peer_index = 0
             return
-        self.selected_peer_index = (self.selected_peer_index + 1) % len(peers)
+        try:
+            self.selected_peer_index = max(0, min(len(peers) - 1, int(index)))
+        except (TypeError, ValueError):
+            self.selected_peer_index = 0
 
     def _selected_peer(self) -> Peer | None:
         peers = self._peers()
@@ -206,19 +288,12 @@ class CyberFishApp:
         self.selected_peer_index %= len(peers)
         return peers[self.selected_peer_index]
 
-    def _assign_selected_peer_to_direction(self, key: int) -> None:
+    def _assign_selected_peer_to_direction(self, direction: object) -> None:
         peer = self._selected_peer()
         if not peer:
             return
-        direction_by_key = {
-            pygame.K_LEFT: "left",
-            pygame.K_RIGHT: "right",
-            pygame.K_UP: "up",
-            pygame.K_DOWN: "down",
-        }
-        direction = direction_by_key.get(key)
         if direction in DIRECTIONS:
-            assign_peer_to_single_direction(self.config.topology, peer.node_id, direction)
+            assign_peer_to_single_direction(self.config.topology, peer.node_id, str(direction))
             save_config(self.config_path, self.config)
 
     def _network_tick(self, now: float) -> None:
@@ -320,7 +395,6 @@ class CyberFishApp:
             peers=self._peers(),
             fps=self.clock.get_fps(),
             paused=self.paused,
-            calibration=self.calibration,
             selected_peer=self._selected_peer(),
         )
         pygame.display.flip()

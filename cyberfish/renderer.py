@@ -7,6 +7,7 @@ import random
 import pygame
 
 from .config import AppConfig
+from .controls import ControlAction, ControlConsole
 from .fish import Fish
 from .network import Peer
 
@@ -37,6 +38,7 @@ class AquariumRenderer:
         self.large_font = pygame.font.Font(None, 28)
         self.bubbles: list[Bubble] = []
         self.ripples: list[Ripple] = []
+        self.console = ControlConsole()
         self._background: pygame.Surface | None = None
         self._background_size: tuple[int, int] | None = None
         self._seed_bubbles()
@@ -56,7 +58,6 @@ class AquariumRenderer:
         peers: list[Peer],
         fps: float,
         paused: bool,
-        calibration: bool,
         selected_peer: Peer | None,
     ) -> None:
         self._draw_background()
@@ -66,10 +67,21 @@ class AquariumRenderer:
         for fish in sorted(fishes, key=lambda item: item.depth):
             self._draw_fish(fish)
         self._draw_vignette()
-        self._draw_hud(config, peers, fps, len(fishes), paused, calibration, selected_peer)
+        self.console.draw(
+            self.screen,
+            config=config,
+            peers=peers,
+            selected_peer=selected_peer,
+            fps=fps,
+            fish_count=len(fishes),
+            paused=paused,
+        )
 
     def add_ripple(self, position: pygame.Vector2, radius: float) -> None:
         self.ripples.append(Ripple(position.x, position.y, radius))
+
+    def handle_console_click(self, position: tuple[int, int]) -> ControlAction | None:
+        return self.console.handle_click(position)
 
     def _seed_bubbles(self) -> None:
         width, height = self.screen.get_size()
@@ -145,16 +157,22 @@ class AquariumRenderer:
         surface = pygame.Surface(canvas_size, pygame.SRCALPHA)
         cx = int(canvas_size[0] * 0.58)
         cy = canvas_size[1] // 2
-        tail_sway = math.sin(fish.phase) * height * 0.35
+        # 掉头时身体向转向方向弯成 C 形：尾巴偏移 + 摆幅放大。
+        turn_intensity = fish.turn_intensity
+        turn_dir = fish.turn_direction if turn_intensity > 0 else 0
+        sway_amplitude = 0.35 + turn_intensity * 0.55
+        tail_sway = math.sin(fish.phase) * height * sway_amplitude
+        tail_offset = -turn_dir * turn_intensity * height * 0.85
+        tail_tip_x = cx - int(length * (0.92 + turn_intensity * 0.18))
         tail = [
-            (cx - int(length * 0.45), cy),
-            (cx - int(length * 0.92), cy - int(height * 0.64 + tail_sway)),
-            (cx - int(length * 0.86), cy + int(height * 0.64 - tail_sway)),
+            (cx - int(length * 0.45), cy + int(tail_offset * 0.3)),
+            (tail_tip_x, cy + int(tail_offset) - int(height * 0.64 + tail_sway)),
+            (tail_tip_x + int(length * 0.06), cy + int(tail_offset) + int(height * 0.64 - tail_sway)),
         ]
         tail_color = tuple(max(0, min(255, int(channel * 0.92))) for channel in fish.color)
         pygame.draw.polygon(surface, (*tail_color, 200), tail)
         body_rect = pygame.Rect(0, 0, length, height)
-        body_rect.center = (cx, cy)
+        body_rect.center = (cx, cy + int(turn_dir * turn_intensity * height * 0.18))
         pygame.draw.ellipse(surface, (*fish.color, 235), body_rect)
         highlight = pygame.Rect(body_rect)
         highlight.height = max(3, int(height * 0.34))
@@ -172,8 +190,10 @@ class AquariumRenderer:
         pygame.draw.circle(surface, (20, 35, 42, 245), (eye_x + 1, cy - int(height * 0.11)), max(1, eye_radius // 2))
 
         angle = math.degrees(math.atan2(fish.velocity.y, fish.velocity.x))
-        rotated = pygame.transform.rotozoom(surface, -angle, 1.0)
-        shadow = pygame.transform.rotozoom(surface, -angle, 1.02)
+        # 掉头时整体水平方向被压扁一点，模拟正在转身，看起来更立体。
+        squash = 1.0 - 0.22 * turn_intensity
+        rotated = pygame.transform.rotozoom(surface, -angle, squash if squash > 0 else 1.0)
+        shadow = pygame.transform.rotozoom(surface, -angle, (squash if squash > 0 else 1.0) * 1.02)
         shadow.fill((0, 0, 0, 70), special_flags=pygame.BLEND_RGBA_MULT)
         shadow_rect = shadow.get_rect(center=(fish.position.x + 10 * fish.depth, fish.position.y + 12 * fish.depth))
         self.screen.blit(shadow, shadow_rect)
@@ -186,50 +206,3 @@ class AquariumRenderer:
         pygame.draw.rect(overlay, (0, 12, 24, 60), overlay.get_rect(), width=18)
         pygame.draw.rect(overlay, (0, 0, 0, 34), (0, height - 80, width, 80))
         self.screen.blit(overlay, (0, 0))
-
-    def _draw_hud(
-        self,
-        config: AppConfig,
-        peers: list[Peer],
-        fps: float,
-        fish_count: int,
-        paused: bool,
-        calibration: bool,
-        selected_peer: Peer | None,
-    ) -> None:
-        width, _height = self.screen.get_size()
-        online_peer_ids = {peer.node_id for peer in peers}
-
-        def topology_label(direction: str) -> str:
-            peer_id = config.topology.get(direction)
-            if not peer_id:
-                return "-"
-            marker = "*" if peer_id in online_peer_ids else "?"
-            return f"{peer_id[:8]}{marker}"
-
-        topology = " ".join(
-            f"{direction[0].upper()}:{topology_label(direction)}"
-            for direction in ("left", "right", "up", "down")
-        )
-        lines = [
-            f"CyberFish  FPS {fps:4.1f}  Fish {fish_count}  Peers {len(peers)}",
-            f"Node {config.node_id}  Network {'ON' if config.network_enabled else 'OFF'}  Sound {'ON' if config.sound_enabled else 'OFF'}",
-            f"State {'PAUSED' if paused else 'RUNNING'}  Topology {topology}",
-        ]
-        if calibration:
-            peer_label = "none"
-            if selected_peer:
-                peer_label = f"{selected_peer.hostname} / {selected_peer.node_id}"
-            lines.append(f"CALIBRATION  Tab selects peer: {peer_label}  Shift+Arrow assigns neighbor")
-        else:
-            lines.append("Space pause  R reset  L network  M sound  F11 fullscreen  C calibrate")
-
-        panel_height = 16 + len(lines) * 22
-        panel = pygame.Surface((min(width - 24, 980), panel_height), pygame.SRCALPHA)
-        panel.fill((2, 18, 31, 168))
-        pygame.draw.rect(panel, (111, 210, 224, 90), panel.get_rect(), 1, border_radius=8)
-        for index, line in enumerate(lines):
-            font = self.large_font if index == 0 else self.font
-            text = font.render(line, True, (224, 248, 252))
-            panel.blit(text, (12, 10 + index * 22))
-        self.screen.blit(panel, (12, 12))

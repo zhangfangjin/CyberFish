@@ -89,6 +89,48 @@ class FishTests(unittest.TestCase):
             "right",
         )
 
+    def test_fish_performs_turn_when_target_is_behind(self) -> None:
+        rng = random.Random(11)
+        fish = Fish(
+            fish_id="turner",
+            position=pygame.Vector2(400, 300),
+            velocity=pygame.Vector2(120, 0),
+            size=60,
+            color=(255, 100, 80),
+            depth=0.5,
+            wander_angle=0.0,
+            wander_jitter=0.4,
+            target_interval=4.0,
+        )
+        # 触发掉头：在朝右游的鱼正后方放一个目标点。
+        fish._maybe_start_turn_to(pygame.Vector2(50, 300), pygame.Vector2(0, 0))
+        self.assertTrue(fish.is_turning, "应当进入掉头动画")
+        self.assertNotEqual(fish.turn_direction, 0)
+
+        # 推进直到掉头结束。
+        steps = 0
+        while fish.is_turning and steps < 200:
+            fish.update(1 / 60.0, [fish], (800, 600), rng)
+            steps += 1
+        self.assertFalse(fish.is_turning)
+        self.assertGreater(fish.turn_cooldown, 0.0)
+        # 掉头完成后，速度方向应明显朝左（x 分量为负）。
+        self.assertLess(fish.velocity.x, 0)
+
+    def test_turn_skipped_when_pressed_against_wall(self) -> None:
+        fish = Fish(
+            fish_id="press",
+            position=pygame.Vector2(770, 300),
+            velocity=pygame.Vector2(120, 0),
+            size=60,
+            color=(255, 100, 80),
+            depth=0.5,
+            wander_angle=0.0,
+        )
+        # 模拟正在贴墙的边界推力。
+        fish._maybe_start_turn_to(pygame.Vector2(50, 300), pygame.Vector2(-0.8, 0))
+        self.assertFalse(fish.is_turning, "贴墙转向时不应叠加掉头动画")
+
 
 if __name__ == "__main__":
     unittest.main()

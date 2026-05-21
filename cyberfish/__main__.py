@@ -8,28 +8,28 @@ from pathlib import Path
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m cyberfish",
-        description="CyberFish Pygame LAN aquarium",
+        description="CyberFish Pygame 局域网水族箱",
     )
     parser.add_argument(
         "--config",
         default="config.json",
-        help="Path to the JSON config file. Defaults to ./config.json.",
+        help="JSON 配置文件路径，默认 ./config.json。",
     )
     parser.add_argument(
         "--headless-smoke",
         action="store_true",
-        help="Run with SDL dummy drivers for automated smoke checks.",
+        help="使用 SDL dummy 驱动运行自动化冒烟检查。",
     )
     parser.add_argument(
         "--duration",
         type=float,
         default=None,
-        help="Optional maximum runtime in seconds.",
+        help="可选的最大运行时长，单位为秒。",
     )
     parser.add_argument(
         "--no-network",
         action="store_true",
-        help="Disable UDP discovery and fish transfers for this run.",
+        help="本次运行禁用 UDP 发现和鱼跨屏移交。",
     )
     return parser
 
