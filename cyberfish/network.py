@@ -41,6 +41,7 @@ class NetworkEvents:
     expired_transfers: list[dict] = field(default_factory=list)
     discovered: list[Peer] = field(default_factory=list)
     acked_transfer_ids: list[str] = field(default_factory=list)
+    topology_claims: list[dict] = field(default_factory=list)
 
 
 class NetworkManager:
@@ -112,6 +113,15 @@ class NetworkManager:
             "sample": sample or [],
         }
         self._send_message(message, (self.broadcast_host, int(self.broadcast_port or self.listen_port)))
+
+    def send_topology_claim(self, message: dict) -> None:
+        """广播一条拓扑协商消息（Negotiation_Message，Requirement 11.1/11.5）。"""
+        payload = dict(message)
+        payload["node_id"] = self.node_id
+        self._send_message(
+            payload,
+            (self.broadcast_host, int(self.broadcast_port or self.listen_port)),
+        )
 
     def send_fish_transfer(self, peer: Peer, fish_payload: dict) -> str:
         transfer_id = f"{self.node_id}-{uuid.uuid4().hex}"
@@ -191,6 +201,8 @@ class NetworkManager:
             self._handle_transfer_ack(message, events)
         elif message_type == "fish_state":
             self._handle_fish_state(message, address, events)
+        elif message_type == "topology":
+            events.topology_claims.append(message)
 
     def _handle_hello(
         self,

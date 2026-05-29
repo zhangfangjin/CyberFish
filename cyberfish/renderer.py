@@ -59,6 +59,7 @@ class AquariumRenderer:
         fps: float,
         paused: bool,
         selected_peer: Peer | None,
+        status_message: str = "",
     ) -> None:
         self._draw_background()
         self._update_bubbles(dt)
@@ -75,6 +76,7 @@ class AquariumRenderer:
             fps=fps,
             fish_count=len(fishes),
             paused=paused,
+            status_message=status_message,
         )
 
     def add_ripple(self, position: pygame.Vector2, radius: float) -> None:

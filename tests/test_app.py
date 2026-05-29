@@ -130,6 +130,28 @@ class AppDisplayTests(unittest.TestCase):
             self.assertEqual(app.config.topology["up"], "node-c")
             self.assertIsNone(app.config.topology["right"])
 
+    def test_toggle_auto_topology_updates_config_and_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = CyberFishApp(Path(temp_dir) / "config.json", force_network_enabled=False)
+            self.assertTrue(app.config.auto_topology)
+            self.assertTrue(app.topology.auto_mode)
+
+            app._handle_console_action(ControlAction("toggle_auto_topology"))
+            self.assertFalse(app.config.auto_topology)
+            self.assertFalse(app.topology.auto_mode)
+
+            # 持久化后重载应保留关闭状态。
+            reloaded = CyberFishApp(Path(temp_dir) / "config.json", force_network_enabled=False)
+            self.assertFalse(reloaded.config.auto_topology)
+
+    def test_manual_assign_rejects_unknown_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = CyberFishApp(Path(temp_dir) / "config.json", force_network_enabled=False)
+            app._peers = lambda: []  # type: ignore[method-assign]
+            # 无在线主机时选择为空，分配应无副作用。
+            app._handle_console_action(ControlAction("assign_direction", "left"))
+            self.assertIsNone(app.config.topology["left"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 from pathlib import Path
 import uuid
 
 
 DIRECTIONS = ("left", "right", "up", "down")
+
+# 四个方向的互逆方向：left<->right、up<->down。
+INVERSE_DIRECTIONS = {
+    "left": "right",
+    "right": "left",
+    "up": "down",
+    "down": "up",
+}
 
 
 def _new_node_id() -> str:
@@ -15,6 +24,23 @@ def _new_node_id() -> str:
 
 def _default_topology() -> dict[str, str | None]:
     return {direction: None for direction in DIRECTIONS}
+
+
+def sanitize_topology(raw: object) -> dict[str, str | None]:
+    """把任意输入规整为恰好包含四个方向键、取值为非空字符串或 None 的拓扑。
+
+    用于满足 Requirement 7.2/7.6：topology 字段必须恰好包含 left/right/up/down
+    四个键，且取值为非空 node_id 字符串或 null；结构非法时回退为四个 null。
+    """
+    topology = _default_topology()
+    if isinstance(raw, dict):
+        for direction in DIRECTIONS:
+            value = raw.get(direction)
+            if isinstance(value, str) and value:
+                topology[direction] = value
+            else:
+                topology[direction] = None
+    return topology
 
 
 @dataclass
@@ -30,6 +56,7 @@ class AppConfig:
     speed_multiplier: float = 1.0
     sound_enabled: bool = True
     network_enabled: bool = True
+    auto_topology: bool = True
     topology: dict[str, str | None] = field(default_factory=_default_topology)
 
     def normalized(self) -> "AppConfig":
@@ -39,15 +66,16 @@ class AppConfig:
         self.window_height = max(360, int(self.window_height))
         self.fish_count = min(200, max(1, int(self.fish_count)))
         self.speed_multiplier = min(4.0, max(0.1, float(self.speed_multiplier)))
-        merged_topology = _default_topology()
-        merged_topology.update(
-            {
-                direction: value
-                for direction, value in self.topology.items()
-                if direction in merged_topology and (value is None or isinstance(value, str))
-            }
-        )
-        self.topology = merged_topology
+        # auto_topology 必须为合法布尔值，否则回退为 True（Requirement 1.2）。
+        if not isinstance(self.auto_topology, bool):
+            self.auto_topology = True
+        # 原地更新 topology，保持外部（如 TopologyCoordinator）持有的引用有效。
+        sanitized = sanitize_topology(self.topology)
+        if isinstance(self.topology, dict):
+            self.topology.clear()
+            self.topology.update(sanitized)
+        else:
+            self.topology = sanitized
         return self
 
     def to_dict(self) -> dict:
@@ -57,9 +85,16 @@ class AppConfig:
 def _merge_defaults(raw: dict) -> dict:
     defaults = AppConfig().to_dict()
     merged = defaults | raw
-    topology = defaults["topology"] | raw.get("topology", {})
-    merged["topology"] = topology
+    merged["topology"] = sanitize_topology(raw.get("topology"))
     return merged
+
+
+def topology_equal(
+    left: dict[str, str | None],
+    right: dict[str, str | None],
+) -> bool:
+    """逐方向比较两个拓扑是否等价，不依赖键顺序或文本格式（Requirement 7.3）。"""
+    return all(left.get(direction) == right.get(direction) for direction in DIRECTIONS)
 
 
 def load_config(path: Path) -> AppConfig:
@@ -79,11 +114,31 @@ def load_config(path: Path) -> AppConfig:
     return config
 
 
-def save_config(path: Path, config: AppConfig) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(config.normalized().to_dict(), handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
+def save_config(path: Path, config: AppConfig) -> bool:
+    """原子化写入配置文件。
+
+    写入失败时保护原文件不被破坏，并返回 False（Requirement 7.7）。
+    """
+    payload = json.dumps(
+        config.normalized().to_dict(),
+        indent=2,
+        ensure_ascii=False,
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.write("\n")
+        os.replace(temp_path, path)
+        return True
+    except OSError:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except (OSError, NameError, UnboundLocalError):
+            pass
+        return False
 
 
 def assign_peer_to_single_direction(

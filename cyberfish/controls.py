@@ -59,11 +59,12 @@ class ControlConsole:
         fps: float,
         fish_count: int,
         paused: bool,
+        status_message: str = "",
     ) -> None:
         self.buttons = []
         width, height = surface.get_size()
         panel_width = min(420, max(330, width - 24))
-        panel_height = min(height - 24, 342)
+        panel_height = min(height - 24, 392)
         panel_rect = pygame.Rect(12, 12, panel_width, panel_height)
 
         panel = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
@@ -112,6 +113,22 @@ class ControlConsole:
             ],
         )
 
+        y += 38
+        self._button_row(
+            surface,
+            x,
+            y,
+            [
+                (
+                    "自动拓扑 开" if config.auto_topology else "自动拓扑 关",
+                    ControlAction("toggle_auto_topology"),
+                    config.auto_topology,
+                    True,
+                ),
+            ],
+            button_width=180,
+        )
+
         y += 44
         self._draw_text(surface, f"鱼数量 {config.fish_count}", (x, y), self.font, (231, 250, 252))
         self._button(surface, pygame.Rect(x + 116, y - 5, 36, 28), "-", ControlAction("fish_dec"), enabled=config.fish_count > 1)
@@ -146,6 +163,10 @@ class ControlConsole:
             ],
             button_width=54,
         )
+
+        if status_message:
+            y += 36
+            self._draw_text(surface, status_message, (x, y), self.small_font, (245, 196, 140))
 
     def handle_click(self, position: tuple[int, int]) -> ControlAction | None:
         for button in reversed(self.buttons):
@@ -239,9 +260,9 @@ class ControlConsole:
         for label, direction in (("左", "left"), ("右", "right"), ("上", "up"), ("下", "down")):
             peer_id = config.topology.get(direction)
             if not peer_id:
-                value = "-"
+                value = "无邻居"
             else:
-                marker = "*" if peer_id in online_peer_ids else "?"
-                value = f"{peer_id[:8]}{marker}"
+                marker = "在线" if peer_id in online_peer_ids else "离线"
+                value = f"{peer_id[:8]}({marker})"
             parts.append(f"{label}:{value}")
         return "拓扑 " + "  ".join(parts)
