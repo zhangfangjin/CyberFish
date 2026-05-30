@@ -10,21 +10,48 @@ from .network import Peer
 
 
 FONT_CANDIDATES = (
+    # macOS
     "PingFang SC",
     "Heiti SC",
     "STHeiti",
     "Hiragino Sans GB",
     "Arial Unicode MS",
+    # Windows
+    "Microsoft YaHei",
+    "Microsoft YaHei UI",
+    "SimHei",
+    "SimSun",
+    "NSimSun",
+    "Microsoft JhengHei",
+    "MingLiU",
+    # Linux / 通用
     "Noto Sans CJK SC",
+    "Noto Sans SC",
+    "Source Han Sans SC",
+    "WenQuanYi Zen Hei",
+    "WenQuanYi Micro Hei",
+    "Droid Sans Fallback",
 )
+
+# pygame.font.match_font 接受逗号分隔的候选名，且会忽略空格大小写。
+_FONT_QUERY = ",".join(name.replace(" ", "") for name in FONT_CANDIDATES)
 
 
 def load_ui_font(size: int) -> pygame.font.Font:
+    # 先逐个精确匹配，命中即用。
     for name in FONT_CANDIDATES:
         path = pygame.font.match_font(name)
         if path:
             return pygame.font.Font(path, size)
-    return pygame.font.Font(None, size)
+    # 再用逗号分隔查询交给 pygame 选最优匹配（不同平台字体名差异较大）。
+    path = pygame.font.match_font(_FONT_QUERY)
+    if path:
+        return pygame.font.Font(path, size)
+    # 兜底：SysFont 在多数平台能挑到一个可用的中文字体。
+    try:
+        return pygame.font.SysFont(_FONT_QUERY, size)
+    except Exception:
+        return pygame.font.Font(None, size)
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,39 @@ RECEIVED_TRANSFER_TTL_SECONDS = 20.0
 MAX_DATAGRAM_BYTES = 65507
 
 
+def detect_local_ip() -> str | None:
+    """探测本机在局域网中的出口 IP（不会真正发包）。失败返回 None。"""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def subnet_broadcast_for(ip: str | None) -> str | None:
+    """由本机 IP 推导出 /24 子网的定向广播地址，如 10.0.0.91 -> 10.0.0.255。
+
+    子网定向广播在 macOS 多网卡环境下比受限广播 255.255.255.255 更可靠。
+    仅对常见的私有 /24 网段做简单推导，无法判断时返回 None。
+    """
+    if not ip:
+        return None
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        if any(not (0 <= int(p) <= 255) for p in parts):
+            return None
+    except ValueError:
+        return None
+    if ip.startswith("127."):
+        return None
+    return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+
+
 @dataclass
 class Peer:
     node_id: str
@@ -42,6 +75,8 @@ class NetworkEvents:
     discovered: list[Peer] = field(default_factory=list)
     acked_transfer_ids: list[str] = field(default_factory=list)
     topology_claims: list[dict] = field(default_factory=list)
+    # 检测到与本机相同 node_id 但来自其它主机的报文时置 True（node_id 冲突）。
+    node_id_conflict: bool = False
 
 
 class NetworkManager:
@@ -84,6 +119,31 @@ class NetworkManager:
         self.listen_port = self._socket.getsockname()[1]
         if self.broadcast_port is None or self.broadcast_port == 0:
             self.broadcast_port = self.listen_port
+        self.local_ip = detect_local_ip()
+        self.broadcast_targets = self._build_broadcast_targets()
+
+    def _build_broadcast_targets(self) -> list[str]:
+        """构造广播目标地址列表：用户配置地址 + 子网定向广播。
+
+        子网定向广播（如 10.0.0.255）在 macOS 多网卡/WiFi 环境下比受限广播
+        255.255.255.255 更可靠，两者都发可显著提升真机互相发现的成功率。
+        """
+        targets: list[str] = []
+
+        def add(host: str | None) -> None:
+            if host and host not in targets:
+                targets.append(host)
+
+        add(self.broadcast_host)
+        add(subnet_broadcast_for(self.local_ip))
+        # 始终兜底加入受限广播。
+        add("255.255.255.255")
+        return targets
+
+    def _broadcast(self, message: dict) -> None:
+        port = int(self.broadcast_port or self.listen_port)
+        for host in self.broadcast_targets:
+            self._send_message(message, (host, port))
 
     @property
     def address(self) -> tuple[str, int]:
@@ -96,10 +156,7 @@ class NetworkManager:
         self.screen_size = screen_size
 
     def send_hello(self) -> None:
-        self._send_message(
-            self._hello_message(),
-            (self.broadcast_host, int(self.broadcast_port or self.listen_port)),
-        )
+        self._broadcast(self._hello_message())
 
     def send_hello_to(self, address: tuple[str, int]) -> None:
         self._send_message(self._hello_message(), address)
@@ -112,16 +169,13 @@ class NetworkManager:
             "fish_count": fish_count,
             "sample": sample or [],
         }
-        self._send_message(message, (self.broadcast_host, int(self.broadcast_port or self.listen_port)))
+        self._broadcast(message)
 
     def send_topology_claim(self, message: dict) -> None:
         """广播一条拓扑协商消息（Negotiation_Message，Requirement 11.1/11.5）。"""
         payload = dict(message)
         payload["node_id"] = self.node_id
-        self._send_message(
-            payload,
-            (self.broadcast_host, int(self.broadcast_port or self.listen_port)),
-        )
+        self._broadcast(payload)
 
     def send_fish_transfer(self, peer: Peer, fish_payload: dict) -> str:
         transfer_id = f"{self.node_id}-{uuid.uuid4().hex}"
@@ -190,6 +244,15 @@ class NetworkManager:
         if not isinstance(message, dict):
             return
         if message.get("node_id") == self.node_id:
+            # 收到与本机相同 node_id 的报文。若来源 IP 不是本机，说明局域网中
+            # 另有主机使用了相同 node_id（通常是直接拷贝了 config.json），
+            # 这会导致双方互相忽略对方、永远无法发现。标记冲突以便上层提示用户。
+            sender_ip = address[0]
+            if (
+                self.local_ip
+                and sender_ip not in ("127.0.0.1", self.local_ip)
+            ):
+                events.node_id_conflict = True
             return
 
         message_type = message.get("type")
@@ -199,10 +262,58 @@ class NetworkManager:
             self._handle_fish_transfer(message, address, events)
         elif message_type == "transfer_ack":
             self._handle_transfer_ack(message, events)
+            self._register_peer_from_message(message, address, events)
         elif message_type == "fish_state":
             self._handle_fish_state(message, address, events)
         elif message_type == "topology":
             events.topology_claims.append(message)
+            self._register_peer_from_message(message, address, events)
+
+    def _register_peer(
+        self,
+        node_id: str,
+        address: tuple[str, int],
+        events: NetworkEvents,
+        *,
+        port: int | None = None,
+        hostname: str | None = None,
+        screen_size: tuple[int, int] | None = None,
+    ) -> bool:
+        """登记或刷新一个 Peer，返回是否为新发现。
+
+        任何携带 node_id 的报文都会让对端被登记，使得即便某一方向的广播不可达
+        （例如 Windows 多网卡只从虚拟网卡发出 255.255.255.255），也能通过收到的
+        单播报文学习到对端，从而补全双向发现。
+        """
+        if not node_id or node_id == self.node_id:
+            return False
+        existing = self.peers.get(node_id)
+        peer = Peer(
+            node_id=node_id,
+            hostname=hostname or (existing.hostname if existing else node_id),
+            address=address[0],
+            port=int(port or address[1]),
+            screen_size=screen_size
+            or (existing.screen_size if existing else (0, 0)),
+            last_seen=self.now(),
+        )
+        is_new = existing is None
+        self.peers[node_id] = peer
+        if is_new:
+            events.discovered.append(peer)
+            # 发现新对端后立即单播回一条 hello，确保反向发现不依赖广播可达性。
+            self.send_hello_to((peer.address, peer.port))
+        return is_new
+
+    def _register_peer_from_message(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        node_id = str(message.get("node_id") or "")
+        if node_id:
+            self._register_peer(node_id, address, events)
 
     def _handle_hello(
         self,
@@ -219,18 +330,14 @@ class NetworkManager:
             size = (int(screen_size[0]), int(screen_size[1]))
         except (TypeError, ValueError, IndexError):
             size = (0, 0)
-        peer = Peer(
-            node_id=node_id,
-            hostname=str(message.get("hostname") or node_id),
-            address=address[0],
+        self._register_peer(
+            node_id,
+            address,
+            events,
             port=port,
+            hostname=str(message.get("hostname") or node_id),
             screen_size=size,
-            last_seen=self.now(),
         )
-        is_new = node_id not in self.peers
-        self.peers[node_id] = peer
-        if is_new:
-            events.discovered.append(peer)
 
     def _handle_fish_state(
         self,
@@ -238,18 +345,7 @@ class NetworkManager:
         address: tuple[str, int],
         events: NetworkEvents,
     ) -> None:
-        if message.get("node_id") not in self.peers:
-            self._handle_hello(
-                {
-                    "type": "hello",
-                    "node_id": message.get("node_id"),
-                    "hostname": message.get("hostname") or message.get("node_id"),
-                    "port": address[1],
-                    "screen_size": [0, 0],
-                },
-                address,
-                events,
-            )
+        self._register_peer_from_message(message, address, events)
 
     def _handle_fish_transfer(
         self,
@@ -263,6 +359,10 @@ class NetworkManager:
         fish_payload = message.get("fish")
         if not transfer_id or not isinstance(fish_payload, dict):
             return
+
+        # 收到鱼移交说明对端能单播到本机；登记其地址以补全反向发现
+        # （即便对端的广播 hello 到不了本机）。
+        self._register_peer_from_message(message, address, events)
 
         self._send_message(
             {

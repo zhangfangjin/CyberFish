@@ -342,6 +342,8 @@ class CyberFishApp:
             self.network.send_topology_claim(self.topology.build_claim_message())
             self._last_topology_claim_at = now
         events = self.network.poll()
+        if events.node_id_conflict:
+            self.status_message = "检测到相同 node_id 的主机，请修改 config.json 的 node_id"
         for claim in events.topology_claims:
             self.topology.on_claim(claim)
         for payload in events.transfers:
