@@ -50,6 +50,8 @@ def subnet_broadcast_for(ip: str | None) -> str | None:
 
 @dataclass
 class Peer:
+    """局域网内一台正在运行 CyberFish 的主机。"""
+
     node_id: str
     hostname: str
     address: str
@@ -60,6 +62,8 @@ class Peer:
 
 @dataclass
 class PendingTransfer:
+    """已发出但尚未收到 ack 的鱼移交请求。"""
+
     message: dict
     address: tuple[str, int]
     fish_payload: dict
@@ -80,6 +84,8 @@ class NetworkEvents:
 
 
 class NetworkManager:
+    """UDP 网络层：负责发现节点、传输鱼、确认移交并清理过期状态。"""
+
     def __init__(
         self,
         node_id: str,
@@ -103,6 +109,7 @@ class NetworkManager:
         self.peers: dict[str, Peer] = {}
         self.pending_transfers: dict[str, PendingTransfer] = {}
         self._received_transfers: dict[str, float] = {}
+        # 单个非阻塞 UDP socket 同时承担发现广播和点对点移交，主循环可每帧 poll。
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -121,6 +128,18 @@ class NetworkManager:
             self.broadcast_port = self.listen_port
         self.local_ip = detect_local_ip()
         self.broadcast_targets = self._build_broadcast_targets()
+        # 网络诊断计数器（用于 --debug-net 叠加层与日志）。
+        self.stats: dict[str, int] = {
+            "hello_sent": 0,
+            "hello_recv": 0,
+            "datagrams_recv": 0,
+            "transfer_sent": 0,
+            "transfer_recv": 0,
+            "ack_sent": 0,
+            "ack_recv": 0,
+            "transfer_expired": 0,
+            "send_errors": 0,
+        }
 
     def _build_broadcast_targets(self) -> list[str]:
         """构造广播目标地址列表：用户配置地址 + 子网定向广播。
@@ -143,6 +162,7 @@ class NetworkManager:
     def _broadcast(self, message: dict) -> None:
         port = int(self.broadcast_port or self.listen_port)
         for host in self.broadcast_targets:
+            # 同一消息发往多个广播目标，提升不同系统/网卡环境下的发现概率。
             self._send_message(message, (host, port))
 
     @property
@@ -157,6 +177,7 @@ class NetworkManager:
 
     def send_hello(self) -> None:
         self._broadcast(self._hello_message())
+        self.stats["hello_sent"] += 1
 
     def send_hello_to(self, address: tuple[str, int]) -> None:
         self._send_message(self._hello_message(), address)
@@ -187,6 +208,7 @@ class NetworkManager:
             "sent_at": self.now(),
             "fish": fish_payload,
         }
+        # 先登记 pending 再发送；若 UDP 包丢失，poll() 会负责短间隔重试。
         pending = PendingTransfer(
             message=message,
             address=(peer.address, peer.port),
@@ -195,9 +217,11 @@ class NetworkManager:
         )
         self.pending_transfers[transfer_id] = pending
         self._send_pending(pending)
+        self.stats["transfer_sent"] += 1
         return transfer_id
 
     def poll(self) -> NetworkEvents:
+        """读取当前 socket 中所有可用报文，并返回本帧需要应用层处理的事件。"""
         events = NetworkEvents()
         while True:
             try:
@@ -206,6 +230,7 @@ class NetworkManager:
                 break
             except OSError:
                 break
+            self.stats["datagrams_recv"] += 1
             self._handle_datagram(raw, address, events)
 
         self._retry_or_expire_pending(events)
@@ -220,6 +245,22 @@ class NetworkManager:
 
     def sorted_peers(self) -> list[Peer]:
         return sorted(self.peers.values(), key=lambda peer: (peer.hostname, peer.node_id))
+
+    def debug_lines(self) -> list[str]:
+        """返回用于屏幕叠加层/日志的网络诊断文本。"""
+        s = self.stats
+        peers = self.sorted_peers()
+        lines = [
+            f"本机IP {self.local_ip or '?'}  端口 {self.listen_port}",
+            f"广播目标 {', '.join(self.broadcast_targets)}",
+            f"在线 {len(peers)}  hello发/收 {s['hello_sent']}/{s['hello_recv']}",
+            f"收包总数 {s['datagrams_recv']}  发送错误 {s['send_errors']}",
+            f"鱼发出/确认 {s['transfer_sent']}/{s['ack_recv']}  超时 {s['transfer_expired']}",
+            f"鱼收到/回ack {s['transfer_recv']}/{s['ack_sent']}",
+        ]
+        for peer in peers:
+            lines.append(f"  · {peer.hostname[:14]} {peer.node_id[:8]} @ {peer.address}:{peer.port}")
+        return lines
 
     def _hello_message(self) -> dict:
         return {
@@ -256,11 +297,15 @@ class NetworkManager:
             return
 
         message_type = message.get("type")
+        # 所有协议消息都用 type 分发；未知消息直接忽略，保证版本不一致时仍稳定。
         if message_type == "hello":
+            self.stats["hello_recv"] += 1
             self._handle_hello(message, address, events)
         elif message_type == "fish_transfer":
+            self.stats["transfer_recv"] += 1
             self._handle_fish_transfer(message, address, events)
         elif message_type == "transfer_ack":
+            self.stats["ack_recv"] += 1
             self._handle_transfer_ack(message, events)
             self._register_peer_from_message(message, address, events)
         elif message_type == "fish_state":
@@ -374,7 +419,9 @@ class NetworkManager:
             },
             address,
         )
+        self.stats["ack_sent"] += 1
         if transfer_id in self._received_transfers:
+            # 重试包只回 ack，不重复生成鱼。
             return
         self._received_transfers[transfer_id] = self.now()
         events.transfers.append(fish_payload)
@@ -392,16 +439,20 @@ class NetworkManager:
         expired: list[str] = []
         for transfer_id, pending in list(self.pending_transfers.items()):
             if now - pending.created_at >= TRANSFER_TIMEOUT_SECONDS:
+                # 超时后把 payload 交还应用层恢复到本机，保证鱼不会永久丢失。
                 events.expired_transfers.append(pending.fish_payload)
                 expired.append(transfer_id)
+                self.stats["transfer_expired"] += 1
                 continue
             if now - pending.last_sent >= TRANSFER_RETRY_SECONDS:
+                # 60ms 重试能覆盖偶发丢包，同时仍满足跨屏切换的低延迟要求。
                 self._send_pending(pending)
         for transfer_id in expired:
             self.pending_transfers.pop(transfer_id, None)
 
     def _drop_stale_peers(self) -> None:
         now = self.now()
+        # hello 超过 TTL 未刷新即视为离线，拓扑层会在下一轮释放相关方向。
         stale = [
             node_id
             for node_id, peer in self.peers.items()
@@ -430,4 +481,5 @@ class NetworkManager:
             payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
             self._socket.sendto(payload, address)
         except OSError:
+            self.stats["send_errors"] += 1
             return

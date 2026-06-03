@@ -14,6 +14,8 @@ from .network import Peer
 
 @dataclass
 class Bubble:
+    """背景气泡，用轻量粒子增强水下运动感。"""
+
     x: float
     y: float
     radius: float
@@ -23,6 +25,8 @@ class Bubble:
 
 @dataclass
 class Ripple:
+    """鱼跨屏移交或接收时生成的短暂水波纹。"""
+
     x: float
     y: float
     radius: float
@@ -31,6 +35,8 @@ class Ripple:
 
 
 class AquariumRenderer:
+    """Pygame 渲染器：绘制背景、水泡、水波、鱼和控制台。"""
+
     def __init__(self, screen: pygame.Surface, rng: random.Random) -> None:
         self.screen = screen
         self.rng = rng
@@ -60,7 +66,9 @@ class AquariumRenderer:
         paused: bool,
         selected_peer: Peer | None,
         status_message: str = "",
+        debug_lines: list[str] | None = None,
     ) -> None:
+        # 绘制顺序从环境到前景：背景 -> 特效 -> 鱼 -> 暗角 -> 控制台。
         self._draw_background()
         self._update_bubbles(dt)
         self._draw_ripples(dt)
@@ -78,6 +86,8 @@ class AquariumRenderer:
             paused=paused,
             status_message=status_message,
         )
+        if debug_lines:
+            self.console.draw_debug_overlay(self.screen, debug_lines)
 
     def add_ripple(self, position: pygame.Vector2, radius: float) -> None:
         self.ripples.append(Ripple(position.x, position.y, radius))
@@ -87,6 +97,7 @@ class AquariumRenderer:
 
     def _seed_bubbles(self) -> None:
         width, height = self.screen.get_size()
+        # 按屏幕面积估算气泡数量，窗口变大后画面不会显得空。
         count = max(16, (width * height) // 70000)
         self.bubbles = [
             Bubble(
@@ -102,6 +113,7 @@ class AquariumRenderer:
     def _draw_background(self) -> None:
         size = self.screen.get_size()
         if self._background is None or self._background_size != size:
+            # 背景渐变只在尺寸变化时重建，避免每帧逐像素绘制影响帧率。
             width, height = size
             background = pygame.Surface(size).convert()
             for y in range(height):
@@ -147,6 +159,7 @@ class AquariumRenderer:
             alpha = int(90 * (1.0 - progress))
             rect = pygame.Rect(0, 0, radius * 2, max(3, int(radius * 0.5)))
             rect.center = (int(ripple.x), int(ripple.y))
+            # 用扁椭圆模拟水面/鱼身扰动，比圆形更像横向水波。
             surface = pygame.Surface(rect.size, pygame.SRCALPHA)
             pygame.draw.ellipse(surface, (180, 235, 248, alpha), surface.get_rect(), 2)
             self.screen.blit(surface, rect)
@@ -159,6 +172,7 @@ class AquariumRenderer:
         surface = pygame.Surface(canvas_size, pygame.SRCALPHA)
         cx = int(canvas_size[0] * 0.58)
         cy = canvas_size[1] // 2
+        # 单条鱼先画到透明画布，再整体旋转，简化头尾/鱼鳍的局部坐标计算。
         # 掉头时身体向转向方向弯成 C 形：尾巴偏移 + 摆幅放大。
         turn_intensity = fish.turn_intensity
         turn_dir = fish.turn_direction if turn_intensity > 0 else 0
@@ -205,6 +219,7 @@ class AquariumRenderer:
     def _draw_vignette(self) -> None:
         width, height = self.screen.get_size()
         overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+        # 暗角压住屏幕边缘，让全屏演示时水族箱边界更明显。
         pygame.draw.rect(overlay, (0, 12, 24, 60), overlay.get_rect(), width=18)
         pygame.draw.rect(overlay, (0, 0, 0, 34), (0, height - 80, width, 80))
         self.screen.blit(overlay, (0, 0))

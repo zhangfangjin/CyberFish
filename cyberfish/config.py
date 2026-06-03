@@ -45,6 +45,8 @@ def sanitize_topology(raw: object) -> dict[str, str | None]:
 
 @dataclass
 class AppConfig:
+    """运行配置，既服务单机演示，也保存多机拓扑校准结果。"""
+
     node_id: str = field(default_factory=_new_node_id)
     udp_port: int = 37777
     broadcast_host: str = "255.255.255.255"
@@ -98,6 +100,7 @@ def topology_equal(
 
 
 def load_config(path: Path) -> AppConfig:
+    """读取配置；首次运行自动创建，旧配置缺字段时补默认值。"""
     if not path.exists():
         config = AppConfig().normalized()
         save_config(path, config)
@@ -146,7 +149,7 @@ def assign_peer_to_single_direction(
     peer_id: str,
     direction: str,
 ) -> dict[str, str | None]:
-    """Assign a peer to exactly one topology direction."""
+    """把一个 peer 绑定到唯一方向，避免同一主机同时占用多条边。"""
     if direction not in DIRECTIONS:
         raise ValueError(f"Invalid topology direction: {direction}")
     for existing_direction in DIRECTIONS:

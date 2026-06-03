@@ -34,6 +34,7 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 
 def _safe_vector(values: list[float] | tuple[float, float], fallback: Vector2) -> Vector2:
+    """从网络 payload 解析速度向量，非法或零向量时回退到指定方向。"""
     try:
         vector = Vector2(float(values[0]), float(values[1]))
     except (IndexError, TypeError, ValueError):
@@ -45,6 +46,8 @@ def _safe_vector(values: list[float] | tuple[float, float], fallback: Vector2) -
 
 @dataclass
 class Fish:
+    """一条鱼的运动状态，包含本机动画参数和跨屏传输所需的最小状态。"""
+
     fish_id: str
     position: Vector2
     velocity: Vector2
@@ -118,6 +121,7 @@ class Fish:
         neighbors = 0
         neighbor_radius = 120.0 * self.scale
 
+        # 简化 Boids 行为：分离避免重叠，对齐/聚合让鱼群看起来有群游趋势。
         for other in fishes:
             if other is self:
                 continue
@@ -346,6 +350,7 @@ class Fish:
             self.velocity.y = -abs(self.velocity.y)
 
     def to_transfer_payload(self, direction: str, bounds: tuple[int, int]) -> dict:
+        """把鱼压缩为 UDP 可传输的数据，只保留接续运动需要的状态。"""
         width, height = bounds
         if direction in ("left", "right"):
             edge_position = clamp(self.position.y / max(1, height), 0.0, 1.0)
@@ -367,6 +372,7 @@ class Fish:
 
     @classmethod
     def from_transfer_payload(cls, payload: dict, bounds: tuple[int, int]) -> "Fish":
+        """从跨屏移交 payload 重建鱼，并放在进入屏幕的对应边缘外侧。"""
         width, height = bounds
         direction = str(payload.get("direction", "right"))
         edge_position = clamp(float(payload.get("edge_position", 0.5)), 0.0, 1.0)
@@ -375,6 +381,7 @@ class Fish:
         body_length = size * (0.55 + depth * 0.75)
 
         if direction == "right":
+            # 对端向右游出时，本机从左侧接入；其它方向同理保持运动连续。
             position = Vector2(-body_length * 0.5, edge_position * height)
         elif direction == "left":
             position = Vector2(width + body_length * 0.5, edge_position * height)
@@ -402,6 +409,7 @@ class Fish:
 
     @classmethod
     def from_expired_transfer_payload(cls, payload: dict, bounds: tuple[int, int]) -> "Fish":
+        """移交未确认时把鱼恢复到发送端边缘，并反向弹回屏内。"""
         fish = cls.from_transfer_payload(payload, bounds)
         direction = str(payload.get("direction", "right"))
         width, height = bounds
@@ -422,6 +430,7 @@ class Fish:
 
 
 def create_random_fish(bounds: tuple[int, int], rng: random.Random, speed_multiplier: float = 1.0) -> Fish:
+    """创建一条随机鱼，初始化个体差异让鱼群轨迹不完全同步。"""
     width, height = bounds
     depth = rng.uniform(0.15, 1.0)
     size = rng.uniform(38.0, 82.0)

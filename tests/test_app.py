@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pygame
 
 from cyberfish.app import CyberFishApp
+from cyberfish.config import load_config
 from cyberfish.controls import ControlAction
 from cyberfish.network import Peer
 
@@ -143,6 +144,28 @@ class AppDisplayTests(unittest.TestCase):
             # 持久化后重载应保留关闭状态。
             reloaded = CyberFishApp(Path(temp_dir) / "config.json", force_network_enabled=False)
             self.assertFalse(reloaded.config.auto_topology)
+
+    def test_forced_network_off_does_not_persist_when_other_settings_are_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            app = CyberFishApp(path, force_network_enabled=False)
+
+            app._handle_console_action(ControlAction("speed_inc"))
+
+            self.assertTrue(load_config(path).network_enabled)
+
+    def test_network_start_failure_is_runtime_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            app = CyberFishApp(path)
+
+            with patch("cyberfish.app.NetworkManager", side_effect=OSError("port busy")):
+                app._start_network()
+
+            self.assertIsNone(app.network)
+            self.assertTrue(app.config.network_enabled)
+            app._shutdown()
+            self.assertTrue(load_config(path).network_enabled)
 
     def test_manual_assign_rejects_unknown_peer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -17,6 +17,8 @@ DEFAULT_BACKGROUND_SOUND = (
 
 
 class AudioController:
+    """背景水声控制器：优先播放资源文件，失败时合成一段循环水流声。"""
+
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
         self.available = False
@@ -27,6 +29,7 @@ class AudioController:
         if not self.enabled:
             return
         try:
+            # mixer 可能在无声卡或 CI 环境不可用，调用方允许静默降级。
             if not pygame.mixer.get_init():
                 pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=1024)
             self._sound = self._load_background_sound() or self._build_water_loop()
@@ -70,6 +73,7 @@ class AudioController:
         rng = random.Random(601)
         total = int(sample_rate * seconds)
 
+        # 多层噪声分别模拟低频水流、细碎气泡和左右声道的空间漂移。
         base_noise = [rng.uniform(-1.0, 1.0) for _ in range(total)]
         fine_noise = [rng.uniform(-1.0, 1.0) for _ in range(total)]
         stereo_noise = [rng.uniform(-1.0, 1.0) for _ in range(total)]
@@ -100,6 +104,7 @@ class AudioController:
 
     @staticmethod
     def _moving_average_circular(values: list[float], radius: int) -> list[float]:
+        """环形移动平均，保证合成音频首尾拼接时没有突兀断点。"""
         if not values:
             return []
         radius = min(max(0, radius), len(values) - 1)
@@ -117,6 +122,7 @@ class AudioController:
 
     @staticmethod
     def _build_spray_layer(total: int, sample_rate: int, rng: random.Random) -> list[float]:
+        """生成短促喷溅层，让循环水声不只是平稳白噪声。"""
         spray = [0.0 for _ in range(total)]
         burst_count = max(8, int(total / sample_rate * 9))
         for _ in range(burst_count):

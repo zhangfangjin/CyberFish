@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import random
 import time
@@ -22,16 +23,23 @@ from .topology import TopologyCoordinator
 
 
 class CyberFishApp:
+    """应用总控：把 Pygame 渲染、鱼群物理、音频和 UDP 网络流程串在同一帧循环里。"""
+
     def __init__(
         self,
         config_path: Path,
         *,
         force_network_enabled: bool | None = None,
+        debug_net: bool = False,
     ) -> None:
         self.config_path = config_path
         self.config: AppConfig = load_config(config_path)
-        if force_network_enabled is not None:
-            self.config.network_enabled = force_network_enabled
+        self._network_enabled = (
+            self.config.network_enabled
+            if force_network_enabled is None
+            else force_network_enabled
+        )
+        self.debug_net = debug_net
         self.rng = random.Random()
         self.clock: pygame.time.Clock | None = None
         self.screen: pygame.Surface | None = None
@@ -52,7 +60,9 @@ class CyberFishApp:
         self._last_state_at = 0.0
         self._last_topology_at = 0.0
         self._last_topology_claim_at = 0.0
+        self._last_debug_log_at = 0.0
         self.status_message: str = ""
+        # 记录最近一次成功写盘的拓扑，避免每帧反复写 config.json。
         self._persisted_topology: dict[str, str | None] = dict(self.config.topology)
 
     def run(self, max_seconds: float | None = None) -> None:
@@ -74,6 +84,7 @@ class CyberFishApp:
                 now = time.monotonic()
                 if max_seconds is not None and now - started_at >= max_seconds:
                     break
+                # 限制单帧最大 dt，窗口拖动或系统卡顿后不会让鱼瞬间跨过整屏。
                 dt = min(0.05, self.clock.tick(60) / 1000.0)
                 self._handle_events()
                 self._network_tick(now)
@@ -112,13 +123,14 @@ class CyberFishApp:
             last_error: pygame.error = exc
         if self.config.display_index != 0:
             try:
+                # 多显示器索引可能失效，回退到主屏保证演示程序仍能启动。
                 return pygame.display.set_mode(size, flags, display=0)
             except pygame.error as exc:
                 last_error = exc
         raise last_error
 
     def _start_network(self) -> None:
-        if not self.config.network_enabled:
+        if not self._network_enabled:
             return
         try:
             self.network = NetworkManager(
@@ -129,8 +141,10 @@ class CyberFishApp:
             )
             self.network.send_hello()
         except OSError:
+            # 课堂/沙箱环境可能禁止 UDP 绑定；失败时降级为单机水族箱。
             self.network = None
-            self.config.network_enabled = False
+            self._network_enabled = False
+            self.status_message = "网络启动失败，已临时降级为单机"
 
     def _shutdown(self) -> None:
         self.audio.stop()
@@ -186,6 +200,7 @@ class CyberFishApp:
                 return
 
     def _console_click_positions(self, position: tuple[int, int]) -> list[tuple[int, int]]:
+        """返回多个可能的点击坐标，兼容 HiDPI 和窗口逻辑/物理像素差异。"""
         candidates: list[tuple[int, int]] = []
 
         def add(point: tuple[int, int]) -> None:
@@ -267,10 +282,11 @@ class CyberFishApp:
         save_config(self.config_path, self.config)
 
     def _toggle_network(self) -> None:
-        self.config.network_enabled = not self.config.network_enabled
-        if self.config.network_enabled and not self.network:
+        self._network_enabled = not self._network_enabled
+        self.config.network_enabled = self._network_enabled
+        if self._network_enabled and not self.network:
             self._start_network()
-        elif not self.config.network_enabled and self.network:
+        elif not self._network_enabled and self.network:
             self.network.close()
             self.network = None
         save_config(self.config_path, self.config)
@@ -331,6 +347,7 @@ class CyberFishApp:
     def _network_tick(self, now: float) -> None:
         if not self.network:
             return
+        # hello 负责发现主机；fish_state 只同步轻量状态供控制台/诊断显示。
         if now - self._last_hello_at >= 1.0:
             self.network.send_hello()
             self._last_hello_at = now
@@ -347,11 +364,13 @@ class CyberFishApp:
         for claim in events.topology_claims:
             self.topology.on_claim(claim)
         for payload in events.transfers:
+            # 收到鱼后按对端给出的边缘位置重建，并用 fish_id 去重，避免重发造成重复鱼。
             fish = Fish.from_transfer_payload(payload, self._bounds())
             self._replace_or_add_fish(fish)
             if self.renderer:
                 self.renderer.add_ripple(fish.position, fish.body_length)
         for payload in events.expired_transfers:
+            # 移交超时说明对端没确认，把鱼放回本机边缘继续游，避免“丢鱼”。
             fish = Fish.from_expired_transfer_payload(payload, self._bounds())
             self._replace_or_add_fish(fish)
         self._topology_tick(now)
@@ -366,6 +385,9 @@ class CyberFishApp:
         self._last_topology_at = now
         if changed and not topology_equal(self.config.topology, self._persisted_topology):
             self._persist_config()
+        if self.debug_net and now - self._last_debug_log_at >= 2.0:
+            self._last_debug_log_at = now
+            print("[debug-net] " + " | ".join(self.network.debug_lines()), flush=True)
 
     def _persist_config(self) -> None:
         """持久化配置；失败时保留内存状态并提示（Requirement 6.4/7.7）。"""
@@ -407,11 +429,13 @@ class CyberFishApp:
                 margin_scale=0.12,
                 only_edges=open_edges,
             )
+            # 已配置且在线的边界才允许移交；发送成功后本机移除该鱼，接收端负责接续。
             if transfer_direction and self._try_transfer_fish(fish, transfer_direction):
                 if self.renderer:
                     self.renderer.add_ripple(fish.position, fish.body_length)
                 continue
             if transfer_direction:
+                # 开放边界一度可用但发送失败时，立即弹回，避免鱼游出屏幕后消失。
                 fish.bounce_inside(bounds)
 
             direction = fish.crossed_edge(bounds)
@@ -421,7 +445,7 @@ class CyberFishApp:
         self.fishes = remaining
 
     def _transfer_ready_edges(self) -> set[str]:
-        if not self.config.network_enabled or not self.network:
+        if not self._network_enabled or not self.network:
             return set()
         return {
             direction
@@ -430,7 +454,7 @@ class CyberFishApp:
         }
 
     def _try_transfer_fish(self, fish: Fish, direction: str) -> bool:
-        if not self.config.network_enabled or not self.network:
+        if not self._network_enabled or not self.network:
             return False
         peer_id = self.config.topology.get(direction)
         peer = self.network.get_peer(peer_id)
@@ -441,21 +465,24 @@ class CyberFishApp:
         return True
 
     def _replace_or_add_fish(self, fish: Fish) -> None:
+        # 使用 fish_id 覆盖旧实例，可抵御 UDP 重试带来的重复 fish_transfer。
         self.fishes = [existing for existing in self.fishes if existing.fish_id != fish.fish_id]
         self.fishes.append(fish)
 
     def _render(self, dt: float) -> None:
         if not self.screen or not self.renderer or not self.clock:
             return
+        render_config = replace(self.config, network_enabled=self._network_enabled)
         self.renderer.render(
             self.fishes,
             dt,
-            config=self.config,
+            config=render_config,
             peers=self._peers(),
             fps=self.clock.get_fps(),
             paused=self.paused,
             selected_peer=self._selected_peer(),
             status_message=self.status_message,
+            debug_lines=self.network.debug_lines() if (self.debug_net and self.network) else None,
         )
         pygame.display.flip()
 

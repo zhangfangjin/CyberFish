@@ -56,6 +56,8 @@ def load_ui_font(size: int) -> pygame.font.Font:
 
 @dataclass(frozen=True)
 class ControlAction:
+    """控制台按钮向应用层发出的轻量命令。"""
+
     name: str
     value: Any = None
 
@@ -70,6 +72,8 @@ class ConsoleButton:
 
 
 class ControlConsole:
+    """左上角中文控制台，负责绘制按钮并维护本帧可点击区域。"""
+
     def __init__(self) -> None:
         self.font = load_ui_font(20)
         self.small_font = load_ui_font(18)
@@ -88,6 +92,7 @@ class ControlConsole:
         paused: bool,
         status_message: str = "",
     ) -> None:
+        # 每帧重建按钮列表，窗口缩放或在线主机数量变化后点击区域会自动跟随布局。
         self.buttons = []
         width, height = surface.get_size()
         panel_width = min(420, max(330, width - 24))
@@ -196,10 +201,33 @@ class ControlConsole:
             self._draw_text(surface, status_message, (x, y), self.small_font, (245, 196, 140))
 
     def handle_click(self, position: tuple[int, int]) -> ControlAction | None:
+        # 后绘制的按钮优先命中，避免重叠区域触发被底层按钮抢走。
         for button in reversed(self.buttons):
             if button.enabled and button.rect.collidepoint(position):
                 return button.action
         return None
+
+    def draw_debug_overlay(self, surface: pygame.Surface, lines: list[str]) -> None:
+        """在屏幕右上角绘制网络诊断叠加层。"""
+        width, _ = surface.get_size()
+        pad = 8
+        line_h = 20
+        panel_w = min(440, max(280, width // 3))
+        panel_h = pad * 2 + line_h * len(lines)
+        x = width - panel_w - 12
+        y = 12
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((28, 6, 6, 200))
+        pygame.draw.rect(panel, (240, 150, 120, 180), panel.get_rect(), 1, border_radius=6)
+        surface.blit(panel, (x, y))
+        for index, text in enumerate(lines):
+            self._draw_text(
+                surface,
+                text,
+                (x + pad, y + pad + index * line_h),
+                self.small_font,
+                (250, 220, 200),
+            )
 
     def _draw_peer_buttons(
         self,
@@ -220,6 +248,7 @@ class ControlConsole:
             label = f"{index + 1}. {peer.hostname[:12]} {peer.node_id[:8]}"
             rect = pygame.Rect(cursor_x, cursor_y, 184, 28)
             if rect.right > right and cursor_x != x:
+                # 在线主机过多时自动换行，控制台仍保留完整可点击区域。
                 cursor_x = x
                 cursor_y += 34
                 rect = pygame.Rect(cursor_x, cursor_y, 184, 28)
@@ -267,6 +296,7 @@ class ControlConsole:
         text = self.font.render(label, True, text_color)
         text_rect = text.get_rect(center=rect.center)
         surface.blit(text, text_rect)
+        # 绘制和点击注册放在同一处，避免布局改动后漏更新 hitbox。
         self.buttons.append(ConsoleButton(label, action, rect.copy(), enabled, active))
 
     def _draw_text(

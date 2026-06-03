@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="本次运行禁用 UDP 发现和鱼跨屏移交。",
     )
+    parser.add_argument(
+        "--debug-net",
+        action="store_true",
+        help="在屏幕右上角叠加显示网络收发统计，并在控制台打印诊断日志，用于排查多机连接问题。",
+    )
     return parser
 
 
@@ -38,6 +43,7 @@ def main() -> int:
     args = build_parser().parse_args()
 
     if args.headless_smoke:
+        # 冒烟测试在无窗口/无音频设备环境运行，必须在导入 pygame 相关模块前设置 SDL。
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
@@ -46,6 +52,7 @@ def main() -> int:
     app = CyberFishApp(
         config_path=Path(args.config),
         force_network_enabled=False if args.no_network else None,
+        debug_net=args.debug_net,
     )
     app.run(max_seconds=args.duration)
     return 0
