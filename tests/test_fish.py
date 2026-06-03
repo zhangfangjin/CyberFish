@@ -56,6 +56,28 @@ class FishTests(unittest.TestCase):
         self.assertGreater(fish.velocity.x, 0)
         self.assertGreaterEqual(fish.position.x, fish.body_length * 0.3)
 
+    def test_edge_detection_requires_outward_velocity(self) -> None:
+        cases = [
+            ("left", pygame.Vector2(-80, 100), pygame.Vector2(-100, 0), pygame.Vector2(100, 0)),
+            ("right", pygame.Vector2(880, 100), pygame.Vector2(100, 0), pygame.Vector2(-100, 0)),
+            ("up", pygame.Vector2(100, -80), pygame.Vector2(0, -100), pygame.Vector2(0, 100)),
+            ("down", pygame.Vector2(100, 680), pygame.Vector2(0, 100), pygame.Vector2(0, -100)),
+        ]
+        for direction, position, outward, inward in cases:
+            with self.subTest(direction=direction):
+                fish = Fish(
+                    fish_id=f"out-{direction}",
+                    position=position.copy(),
+                    velocity=outward.copy(),
+                    size=60,
+                    color=(255, 100, 80),
+                    depth=0.5,
+                )
+                self.assertEqual(fish.crossed_edge((800, 600)), direction)
+
+                fish.velocity = inward.copy()
+                self.assertIsNone(fish.crossed_edge((800, 600)))
+
     def test_transfer_payload_round_trip_enters_opposite_edge(self) -> None:
         fish = Fish(
             fish_id="f1",
@@ -71,6 +93,36 @@ class FishTests(unittest.TestCase):
         self.assertEqual(incoming.fish_id, "f1")
         self.assertLess(incoming.position.x, 0)
         self.assertAlmostEqual(incoming.position.y, 384, delta=1.0)
+        self.assertGreater(incoming.velocity.x, 0)
+
+    def test_incoming_transfer_is_not_bounced_back_out(self) -> None:
+        outgoing = Fish(
+            fish_id="incoming",
+            position=pygame.Vector2(850, 300),
+            velocity=pygame.Vector2(120, 0),
+            size=50,
+            color=(1, 2, 3),
+            depth=0.7,
+            phase=1.5,
+        )
+        payload = outgoing.to_transfer_payload("right", (800, 600))
+        incoming = Fish.from_transfer_payload(payload, (1024, 768))
+        start_x = incoming.position.x
+
+        self.assertLess(incoming.position.x, 0)
+        self.assertIsNone(
+            incoming.crossed_edge((1024, 768), margin_scale=0.12, only_edges={"left"})
+        )
+
+        incoming.update(
+            0.1,
+            [incoming],
+            (1024, 768),
+            random.Random(3),
+            open_edges={"left"},
+        )
+
+        self.assertGreater(incoming.position.x, start_x)
         self.assertGreater(incoming.velocity.x, 0)
 
     def test_open_edge_transfer_can_trigger_soon_after_boundary_cross(self) -> None:

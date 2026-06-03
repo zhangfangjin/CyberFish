@@ -322,13 +322,29 @@ class Fish:
     ) -> str | None:
         width, height = bounds
         margin = self.body_length * margin_scale
-        if self.position.x < -margin and (only_edges is None or "left" in only_edges):
+        if (
+            self.position.x < -margin
+            and self.velocity.x < 0
+            and (only_edges is None or "left" in only_edges)
+        ):
             return "left"
-        if self.position.x > width + margin and (only_edges is None or "right" in only_edges):
+        if (
+            self.position.x > width + margin
+            and self.velocity.x > 0
+            and (only_edges is None or "right" in only_edges)
+        ):
             return "right"
-        if self.position.y < -margin and (only_edges is None or "up" in only_edges):
+        if (
+            self.position.y < -margin
+            and self.velocity.y < 0
+            and (only_edges is None or "up" in only_edges)
+        ):
             return "up"
-        if self.position.y > height + margin and (only_edges is None or "down" in only_edges):
+        if (
+            self.position.y > height + margin
+            and self.velocity.y > 0
+            and (only_edges is None or "down" in only_edges)
+        ):
             return "down"
         return None
 
