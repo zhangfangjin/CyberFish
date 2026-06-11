@@ -8,6 +8,9 @@ import uuid
 
 
 DIRECTIONS = ("left", "right", "up", "down")
+ROLE_ADMIN = "admin"
+ROLE_DISPLAY_NODE = "display_node"
+ROLES = (ROLE_ADMIN, ROLE_DISPLAY_NODE)
 
 # 四个方向的互逆方向：left<->right、up<->down。
 INVERSE_DIRECTIONS = {
@@ -43,9 +46,21 @@ def sanitize_topology(raw: object) -> dict[str, str | None]:
     return topology
 
 
+def sanitize_role(raw: object) -> str:
+    if isinstance(raw, str) and raw in ROLES:
+        return raw
+    return ROLE_DISPLAY_NODE
+
+
+def sanitize_optional_node_id(raw: object) -> str | None:
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
+
+
 @dataclass
 class AppConfig:
-    """运行配置，既服务单机演示，也保存多机拓扑校准结果。"""
+    """运行配置；拓扑只作为运行态字段，不持久保存邻居关系。"""
 
     node_id: str = field(default_factory=_new_node_id)
     udp_port: int = 37777
@@ -59,6 +74,8 @@ class AppConfig:
     sound_enabled: bool = True
     network_enabled: bool = True
     auto_topology: bool = True
+    role: str = ROLE_DISPLAY_NODE
+    admin_id: str | None = None
     topology: dict[str, str | None] = field(default_factory=_default_topology)
 
     def normalized(self) -> "AppConfig":
@@ -71,6 +88,8 @@ class AppConfig:
         # auto_topology 必须为合法布尔值，否则回退为 True（Requirement 1.2）。
         if not isinstance(self.auto_topology, bool):
             self.auto_topology = True
+        self.role = sanitize_role(self.role)
+        self.admin_id = sanitize_optional_node_id(self.admin_id)
         # 原地更新 topology，保持外部（如 TopologyCoordinator）持有的引用有效。
         sanitized = sanitize_topology(self.topology)
         if isinstance(self.topology, dict):
@@ -87,7 +106,10 @@ class AppConfig:
 def _merge_defaults(raw: dict) -> dict:
     defaults = AppConfig().to_dict()
     merged = defaults | raw
-    merged["topology"] = sanitize_topology(raw.get("topology"))
+    # 拓扑关系每次启动都重新发现/协商，不继承上次运行写入的邻居。
+    merged["topology"] = _default_topology()
+    # 管理员身份是局域网运行态，每次启动由发现消息重新判定。
+    merged["admin_id"] = None
     return merged
 
 
@@ -117,13 +139,22 @@ def load_config(path: Path) -> AppConfig:
     return config
 
 
+def _persistent_payload(config: AppConfig) -> dict:
+    payload = config.normalized().to_dict()
+    # 只清除写盘内容，不改 config.topology 本身；运行中的拓扑仍用于跨屏移交。
+    payload["topology"] = _default_topology()
+    # admin_id 是当前运行态发现结果，不写入配置文件。
+    payload["admin_id"] = None
+    return payload
+
+
 def save_config(path: Path, config: AppConfig) -> bool:
     """原子化写入配置文件。
 
     写入失败时保护原文件不被破坏，并返回 False（Requirement 7.7）。
     """
     payload = json.dumps(
-        config.normalized().to_dict(),
+        _persistent_payload(config),
         indent=2,
         ensure_ascii=False,
     )

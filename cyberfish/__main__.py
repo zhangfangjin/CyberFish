@@ -31,6 +31,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="本次运行禁用 UDP 发现和鱼跨屏移交。",
     )
+    role_group = parser.add_mutually_exclusive_group()
+    role_group.add_argument(
+        "--admin",
+        action="store_true",
+        help="本次运行临时作为管理员主机启动。",
+    )
+    role_group.add_argument(
+        "--display-node",
+        action="store_true",
+        help="本次运行临时作为演示节点启动。",
+    )
     parser.add_argument(
         "--debug-net",
         action="store_true",
@@ -48,10 +59,18 @@ def main() -> int:
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
     from .app import CyberFishApp
+    from .config import ROLE_ADMIN, ROLE_DISPLAY_NODE
+
+    role_override = None
+    if args.admin:
+        role_override = ROLE_ADMIN
+    elif args.display_node:
+        role_override = ROLE_DISPLAY_NODE
 
     app = CyberFishApp(
         config_path=Path(args.config),
         force_network_enabled=False if args.no_network else None,
+        role_override=role_override,
         debug_net=args.debug_net,
     )
     app.run(max_seconds=args.duration)

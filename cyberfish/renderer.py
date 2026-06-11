@@ -65,7 +65,12 @@ class AquariumRenderer:
         fps: float,
         paused: bool,
         selected_peer: Peer | None,
+        local_fish_count: int | None = None,
         status_message: str = "",
+        effective_role: str | None = None,
+        admin_id: str | None = None,
+        admin_conflict: bool = False,
+        admin_ack_status: dict[str, str] | None = None,
         debug_lines: list[str] | None = None,
     ) -> None:
         # 绘制顺序从环境到前景：背景 -> 特效 -> 鱼 -> 暗角 -> 控制台。
@@ -82,9 +87,13 @@ class AquariumRenderer:
             peers=peers,
             selected_peer=selected_peer,
             fps=fps,
-            fish_count=len(fishes),
+            fish_count=len(fishes) if local_fish_count is None else local_fish_count,
             paused=paused,
             status_message=status_message,
+            effective_role=effective_role,
+            admin_id=admin_id,
+            admin_conflict=admin_conflict,
+            admin_ack_status=admin_ack_status,
         )
         if debug_lines:
             self.console.draw_debug_overlay(self.screen, debug_lines)

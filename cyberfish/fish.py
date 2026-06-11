@@ -17,6 +17,15 @@ OPPOSITE_DIRECTIONS = {
     "down": "up",
 }
 
+ANIMATION_SWIMMING = "swimming"
+ANIMATION_TURNING = "turning"
+ANIMATION_TRANSFERRING = "transferring"
+VALID_ANIMATION_STATES = {
+    ANIMATION_SWIMMING,
+    ANIMATION_TURNING,
+    ANIMATION_TRANSFERRING,
+}
+
 
 PALETTE: tuple[tuple[int, int, int], ...] = (
     (239, 112, 96),
@@ -44,6 +53,92 @@ def _safe_vector(values: list[float] | tuple[float, float], fallback: Vector2) -
     return vector
 
 
+def _safe_float(value: object, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_int(value: object, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_bool(value: object, fallback: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return fallback
+
+
+def _safe_node_id(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _safe_animation_state(value: object, fallback: str = ANIMATION_SWIMMING) -> str:
+    if isinstance(value, str) and value in VALID_ANIMATION_STATES:
+        return value
+    return fallback
+
+
+def _safe_color(raw: object, fallback: tuple[int, int, int] = PALETTE[0]) -> tuple[int, int, int]:
+    if not isinstance(raw, (list, tuple)):
+        return fallback
+    channels = []
+    for index in range(3):
+        try:
+            channels.append(int(clamp(float(raw[index]), 0, 255)))
+        except (IndexError, TypeError, ValueError):
+            channels.append(fallback[index])
+    return (channels[0], channels[1], channels[2])
+
+
+def _rounded(value: float) -> float:
+    return round(float(value), 4)
+
+
+def _direction_from_vector(vector: Vector2) -> str:
+    if abs(vector.x) >= abs(vector.y):
+        return "right" if vector.x >= 0 else "left"
+    return "down" if vector.y >= 0 else "up"
+
+
+def _velocity_from_direction(direction: object, speed: object, fallback: Vector2) -> Vector2:
+    direction_text = str(direction or "")
+    if direction_text not in OPPOSITE_DIRECTIONS:
+        return fallback.copy()
+    fallback_speed = fallback.length() if fallback.length_squared() else 120.0
+    magnitude = max(1.0, _safe_float(speed, fallback_speed))
+    vectors = {
+        "right": Vector2(1.0, 0.0),
+        "left": Vector2(-1.0, 0.0),
+        "up": Vector2(0.0, -1.0),
+        "down": Vector2(0.0, 1.0),
+    }
+    return vectors[direction_text] * magnitude
+
+
+def _payload_velocity(payload: dict, fallback: Vector2) -> Vector2:
+    raw_velocity = payload.get("v")
+    if not isinstance(raw_velocity, (list, tuple)):
+        raw_velocity = payload.get("velocity")
+    if isinstance(raw_velocity, (list, tuple)):
+        return _safe_vector(raw_velocity, fallback)
+    return _velocity_from_direction(payload.get("direction"), payload.get("speed"), fallback)
+
+
 @dataclass
 class Fish:
     """一条鱼的运动状态，包含本机动画参数和跨屏传输所需的最小状态。"""
@@ -68,6 +163,9 @@ class Fish:
     turn_end_angle: float = 0.0
     turn_direction: int = 0
     turn_cooldown: float = 0.0
+    current_node_id: str | None = None
+    animation_state: str = ANIMATION_SWIMMING
+    is_transferring: bool = False
 
     @property
     def scale(self) -> float:
@@ -84,6 +182,22 @@ class Fish:
     @property
     def is_turning(self) -> bool:
         return self.turn_duration > 0.0 and self.turn_progress < self.turn_duration
+
+    @property
+    def direction(self) -> str:
+        return _direction_from_vector(self.velocity)
+
+    @property
+    def speed(self) -> float:
+        return self.velocity.length()
+
+    @property
+    def effective_animation_state(self) -> str:
+        if self.is_transferring or self.animation_state == ANIMATION_TRANSFERRING:
+            return ANIMATION_TRANSFERRING
+        if self.is_turning or self.animation_state == ANIMATION_TURNING:
+            return ANIMATION_TURNING
+        return ANIMATION_SWIMMING
 
     @property
     def turn_intensity(self) -> float:
@@ -111,8 +225,12 @@ class Fish:
             self.turn_cooldown = max(0.0, self.turn_cooldown - dt)
 
         if self.is_turning:
+            self.animation_state = ANIMATION_TURNING
             self._update_turning(dt, bounds, open_edges, speed_multiplier)
             return
+
+        if not self.is_transferring:
+            self.animation_state = ANIMATION_SWIMMING
 
         desired = Vector2()
         separation = Vector2()
@@ -270,6 +388,7 @@ class Fish:
         self.turn_end_angle = heading_angle + direction * math.pi
         self.turn_progress = 0.0
         self.turn_duration = 0.55
+        self.animation_state = ANIMATION_TURNING
 
     def _update_turning(
         self,
@@ -278,6 +397,7 @@ class Fish:
         open_edges: set[str],
         speed_multiplier: float,
     ) -> None:
+        self.animation_state = ANIMATION_TURNING
         self.turn_progress = min(self.turn_duration, self.turn_progress + dt)
         t = self.turn_progress / self.turn_duration if self.turn_duration > 0 else 1.0
         # smoothstep：两端慢、中段快，符合身体抡尾的节奏感。
@@ -312,6 +432,8 @@ class Fish:
             self.turn_duration = 0.0
             self.turn_progress = 0.0
             self.turn_cooldown = 4.0
+            if not self.is_transferring:
+                self.animation_state = ANIMATION_SWIMMING
 
     def crossed_edge(
         self,
@@ -374,26 +496,98 @@ class Fish:
             edge_position = clamp(self.position.x / max(1, width), 0.0, 1.0)
         return {
             "fish_id": self.fish_id,
+            "fishId": self.fish_id,
+            "currentNodeId": self.current_node_id,
             "direction": direction,
             "edge_position": edge_position,
             "velocity": [self.velocity.x, self.velocity.y],
+            "speed": self.speed,
             "size": self.size,
             "color": list(self.color),
             "depth": self.depth,
+            "z": self.depth,
             "phase": self.phase,
             "wander_jitter": self.wander_jitter,
             "turn_bias": self.turn_bias,
             "target_interval": self.target_interval,
+            "animationState": ANIMATION_TRANSFERRING,
+            "isTransferring": True,
         }
+
+    def to_state_payload(self, bounds: tuple[int, int]) -> dict:
+        """序列化完整实时状态；坐标归一化但不裁剪，保留跨边界连续性。"""
+        width, height = bounds
+        return {
+            "id": self.fish_id,
+            "fishId": self.fish_id,
+            "currentNodeId": self.current_node_id,
+            "x": _rounded(self.position.x),
+            "y": _rounded(self.position.y),
+            "z": _rounded(self.depth),
+            "p": [
+                _rounded(self.position.x / max(1, width)),
+                _rounded(self.position.y / max(1, height)),
+            ],
+            "v": [_rounded(self.velocity.x), _rounded(self.velocity.y)],
+            "direction": self.direction,
+            "speed": _rounded(self.speed),
+            "s": _rounded(self.size),
+            "c": list(self.color),
+            "d": _rounded(self.depth),
+            "animationState": self.effective_animation_state,
+            "isTransferring": bool(self.is_transferring),
+            "ph": _rounded(self.phase),
+            "a": _rounded(self.age),
+            "wa": _rounded(self.wander_angle),
+            "wj": _rounded(self.wander_jitter),
+            "tb": _rounded(self.turn_bias),
+            "ti": _rounded(self.target_interval),
+            "wt": _rounded(self.wander_timer),
+            "tp": _rounded(self.turn_progress),
+            "td": _rounded(self.turn_duration),
+            "tsa": _rounded(self.turn_start_angle),
+            "tea": _rounded(self.turn_end_angle),
+            "tdr": int(self.turn_direction),
+            "tc": _rounded(self.turn_cooldown),
+        }
+
+    def copy_for_render(self, position: Vector2) -> "Fish":
+        return Fish(
+            fish_id=self.fish_id,
+            position=position.copy(),
+            velocity=self.velocity.copy(),
+            size=self.size,
+            color=self.color,
+            depth=self.depth,
+            phase=self.phase,
+            age=self.age,
+            wander_angle=self.wander_angle,
+            wander_jitter=self.wander_jitter,
+            turn_bias=self.turn_bias,
+            target_interval=self.target_interval,
+            wander_timer=self.wander_timer,
+            wander_target=self.wander_target.copy() if self.wander_target is not None else None,
+            turn_progress=self.turn_progress,
+            turn_duration=self.turn_duration,
+            turn_start_angle=self.turn_start_angle,
+            turn_end_angle=self.turn_end_angle,
+            turn_direction=self.turn_direction,
+            turn_cooldown=self.turn_cooldown,
+            current_node_id=self.current_node_id,
+            animation_state=self.animation_state,
+            is_transferring=self.is_transferring,
+        )
 
     @classmethod
     def from_transfer_payload(cls, payload: dict, bounds: tuple[int, int]) -> "Fish":
         """从跨屏移交 payload 重建鱼，并放在进入屏幕的对应边缘外侧。"""
         width, height = bounds
         direction = str(payload.get("direction", "right"))
-        edge_position = clamp(float(payload.get("edge_position", 0.5)), 0.0, 1.0)
-        size = clamp(float(payload.get("size", 54.0)), 24.0, 120.0)
-        depth = clamp(float(payload.get("depth", 0.6)), 0.0, 1.0)
+        if direction not in OPPOSITE_DIRECTIONS:
+            direction = "right"
+        edge_position = clamp(_safe_float(payload.get("edge_position", 0.5), 0.5), 0.0, 1.0)
+        size = clamp(_safe_float(payload.get("size", 54.0), 54.0), 24.0, 120.0)
+        depth = clamp(_safe_float(payload.get("depth", payload.get("z", 0.6)), 0.6), 0.0, 1.0)
         body_length = size * (0.55 + depth * 0.75)
 
         if direction == "right":
@@ -408,20 +602,111 @@ class Fish:
 
         fallback_angle = {"right": 0, "left": 180, "up": -90, "down": 90}.get(direction, 0)
         fallback_velocity = Vector2(120, 0).rotate(fallback_angle)
-        velocity = _safe_vector(payload.get("velocity", [fallback_velocity.x, fallback_velocity.y]), fallback_velocity)
+        velocity = _payload_velocity(payload, fallback_velocity)
         return cls(
-            fish_id=str(payload.get("fish_id") or uuid.uuid4().hex),
+            fish_id=str(payload.get("fish_id") or payload.get("fishId") or uuid.uuid4().hex),
             position=position,
             velocity=velocity,
             size=size,
-            color=tuple(int(clamp(channel, 0, 255)) for channel in payload.get("color", PALETTE[0]))[:3],
+            color=_safe_color(payload.get("color", PALETTE[0])),
             depth=depth,
-            phase=float(payload.get("phase", 0.0)),
+            phase=_safe_float(payload.get("phase", 0.0), 0.0),
             wander_angle=math.atan2(velocity.y, velocity.x),
-            wander_jitter=clamp(float(payload.get("wander_jitter", 0.55)), 0.1, 1.5),
-            turn_bias=clamp(float(payload.get("turn_bias", 0.0)), -0.6, 0.6),
-            target_interval=clamp(float(payload.get("target_interval", 4.0)), 1.5, 8.0),
+            wander_jitter=clamp(_safe_float(payload.get("wander_jitter", 0.55), 0.55), 0.1, 1.5),
+            turn_bias=clamp(_safe_float(payload.get("turn_bias", 0.0), 0.0), -0.6, 0.6),
+            target_interval=clamp(_safe_float(payload.get("target_interval", 4.0), 4.0), 1.5, 8.0),
+            animation_state=ANIMATION_SWIMMING,
+            is_transferring=False,
         )
+
+    @classmethod
+    def from_state_payload(cls, payload: dict, bounds: tuple[int, int]) -> "Fish":
+        """从完整实时状态重建渲染用鱼，保持远端动画字段。"""
+        width, height = bounds
+        raw_position = payload.get("p")
+        if not isinstance(raw_position, (list, tuple)):
+            raw_position = [payload.get("x", 0.5), payload.get("y", 0.5)]
+        fallback_velocity = Vector2(120.0, 0.0)
+        velocity = _payload_velocity(payload, fallback_velocity)
+        fish = cls(
+            fish_id=str(
+                payload.get("id")
+                or payload.get("fish_id")
+                or payload.get("fishId")
+                or uuid.uuid4().hex
+            ),
+            position=Vector2(
+                _safe_float(raw_position[0] if len(raw_position) > 0 else 0.5, 0.5) * width,
+                _safe_float(raw_position[1] if len(raw_position) > 1 else 0.5, 0.5) * height,
+            ),
+            velocity=velocity,
+            size=clamp(_safe_float(payload.get("s", payload.get("size", 54.0)), 54.0), 24.0, 120.0),
+            color=_safe_color(payload.get("c", payload.get("color", PALETTE[0]))),
+            depth=clamp(_safe_float(payload.get("d", payload.get("depth", 0.6)), 0.6), 0.0, 1.0),
+            phase=_safe_float(payload.get("ph", payload.get("phase", 0.0)), 0.0),
+            age=max(0.0, _safe_float(payload.get("a", payload.get("age", 0.0)), 0.0)),
+            wander_angle=_safe_float(
+                payload.get("wa", payload.get("wander_angle", math.atan2(velocity.y, velocity.x))),
+                math.atan2(velocity.y, velocity.x),
+            ),
+            wander_jitter=clamp(
+                _safe_float(payload.get("wj", payload.get("wander_jitter", 0.55)), 0.55),
+                0.1,
+                1.5,
+            ),
+            turn_bias=clamp(
+                _safe_float(payload.get("tb", payload.get("turn_bias", 0.0)), 0.0),
+                -0.6,
+                0.6,
+            ),
+            target_interval=clamp(
+                _safe_float(payload.get("ti", payload.get("target_interval", 4.0)), 4.0),
+                1.5,
+                8.0,
+            ),
+            wander_timer=max(
+                0.0,
+                _safe_float(payload.get("wt", payload.get("wander_timer", 0.0)), 0.0),
+            ),
+            turn_progress=max(
+                0.0,
+                _safe_float(payload.get("tp", payload.get("turn_progress", 0.0)), 0.0),
+            ),
+            turn_duration=max(
+                0.0,
+                _safe_float(payload.get("td", payload.get("turn_duration", 0.0)), 0.0),
+            ),
+            turn_start_angle=_safe_float(
+                payload.get("tsa", payload.get("turn_start_angle", 0.0)),
+                0.0,
+            ),
+            turn_end_angle=_safe_float(
+                payload.get("tea", payload.get("turn_end_angle", 0.0)),
+                0.0,
+            ),
+            turn_direction=_safe_int(
+                payload.get("tdr", payload.get("turn_direction", 0)),
+                0,
+            ),
+            turn_cooldown=max(
+                0.0,
+                _safe_float(payload.get("tc", payload.get("turn_cooldown", 0.0)), 0.0),
+            ),
+            current_node_id=_safe_node_id(
+                payload.get("currentNodeId", payload.get("current_node_id"))
+            ),
+            animation_state=_safe_animation_state(
+                payload.get("animationState", payload.get("animation_state")),
+                ANIMATION_SWIMMING,
+            ),
+            is_transferring=_safe_bool(
+                payload.get("isTransferring", payload.get("is_transferring")),
+                False,
+            ),
+        )
+        if "animationState" not in payload and "animation_state" not in payload:
+            fish.animation_state = fish.effective_animation_state
+        return fish
 
     @classmethod
     def from_expired_transfer_payload(cls, payload: dict, bounds: tuple[int, int]) -> "Fish":
@@ -445,7 +730,13 @@ class Fish:
         return fish
 
 
-def create_random_fish(bounds: tuple[int, int], rng: random.Random, speed_multiplier: float = 1.0) -> Fish:
+def create_random_fish(
+    bounds: tuple[int, int],
+    rng: random.Random,
+    speed_multiplier: float = 1.0,
+    *,
+    current_node_id: str | None = None,
+) -> Fish:
     """创建一条随机鱼，初始化个体差异让鱼群轨迹不完全同步。"""
     width, height = bounds
     depth = rng.uniform(0.15, 1.0)
@@ -470,4 +761,5 @@ def create_random_fish(bounds: tuple[int, int], rng: random.Random, speed_multip
         wander_jitter=rng.uniform(0.35, 0.95),
         turn_bias=rng.gauss(0.0, 0.18),
         target_interval=rng.uniform(2.5, 6.5),
+        current_node_id=current_node_id,
     )

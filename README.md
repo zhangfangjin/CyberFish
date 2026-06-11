@@ -68,7 +68,13 @@
 venv/bin/python -m cyberfish
 ```
 
-首次启动会自动生成 `config.json`。如果需要临时关闭网络：
+首次启动会自动生成 `config.json`。默认角色是演示节点，只显示状态面板并接收管理员命令。选择一台主机作为管理员时使用：
+
+```bash
+venv/bin/python -m cyberfish --admin
+```
+
+如需临时强制以演示节点启动，可使用 `--display-node`。如果需要临时关闭网络：
 
 ```bash
 venv/bin/python -m cyberfish --no-network
@@ -82,7 +88,7 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy venv/bin/python -m cyberfish --headl
 
 ## 界面控制台
 
-程序左上角提供中文点击式控制台，不需要记忆键盘快捷键：
+管理员主机左上角提供中文点击式控制台，不需要记忆键盘快捷键；演示节点只显示本机状态、管理员连接状态、在线主机和鱼数量，不响应本地控制台点击。
 
 - `暂停 / 继续`：暂停或恢复鱼群游动。
 - `重置`：重新生成鱼群。
@@ -99,13 +105,27 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy venv/bin/python -m cyberfish --headl
 
 ## 多机联动校准
 
-1. 在同一局域网的多台主机上运行 `venv/bin/python -m cyberfish`。
-2. 等待左上角控制台中 `在线主机` 数量出现。
-3. 在左上角控制台的 `选择在线主机` 区域点击某台在线主机。
-4. 在 `设置相邻方向` 区域点击 `左 / 右 / 上 / 下` 保存该主机与本机的相邻方向。
-5. 每台机器都按真实摆放关系完成一次校准。
+1. 在同一局域网中选择一台主机运行 `venv/bin/python -m cyberfish --admin`。
+2. 其余主机运行 `venv/bin/python -m cyberfish` 或 `venv/bin/python -m cyberfish --display-node`。
+3. 等待管理员控制台中 `在线主机` 数量出现；如果多台主机声明管理员，系统按 `node_id` 字典序选择唯一管理员，其余管理员自动降级为演示节点。
+4. 在管理员控制台的 `选择在线主机` 区域点击某台在线主机。
+5. 在 `设置相邻方向` 区域点击 `左 / 右 / 上 / 下` 保存该主机与本机的相邻方向。
+6. 每台机器都按真实摆放关系完成一次校准。
 
-鱼从已配置邻接方向游出时，会通过 UDP `fish_transfer` 消息发送给对应主机；接收主机会发送 `transfer_ack`。如果发送端短时间内没有收到确认，会把鱼放回本机边缘，避免鱼丢失。
+运行中每台主机会以 10Hz 通过 UDP `STATUS_SYNC` 广播本机完整鱼状态，包括编号、归一化坐标、速度、尺寸、颜色和动画字段。接收端缓存相邻主机的快照，只把共享边界附近的远端鱼作为接缝预览渲染，不会把所有远端鱼镜像到本机。
+
+鱼从已配置邻接方向游出时，会通过 UDP `fish_transfer` 消息发送给对应主机；接收主机会发送 `transfer_ack`，此消息负责唯一的鱼所有权切换。如果发送端短时间内没有收到确认，会把鱼放回本机边缘，避免鱼丢失。
+
+标准网络消息类型覆盖 FR-45 到 FR-51：
+
+- `DISCOVER` / `DISCOVER_RESPONSE`：主机发现请求与发现响应。
+- `HEARTBEAT`：运行期在线状态刷新。
+- `fish_transfer` / `transfer_ack`：游鱼跨屏移交与确认。
+- `STATUS_SYNC`：同步游鱼编号、坐标、方向、速度等完整状态。
+- `NODE_JOIN` / `NODE_LEAVE`：主机动态加入与退出。
+- `TOPOLOGY_UPDATE`：主机退出、加入或协商变化后更新屏幕拓扑关系。
+
+为兼容旧版本，接收端仍识别 `hello`、`fish_state`、`topology` 旧消息类型；新版本出站默认使用上面的标准类型。
 
 ## 配置文件
 
@@ -116,7 +136,9 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy venv/bin/python -m cyberfish --headl
 - `fullscreen` / `display_index` / `window_width` / `window_height`：显示配置。
 - `fish_count` / `speed_multiplier`：鱼数量与速度。
 - `sound_enabled` / `network_enabled`：音效与跨屏联动开关。
-- `topology`：`left`、`right`、`up`、`down` 四个方向对应的邻居节点 ID。
+- `role`：本机默认角色，取值为 `admin` 或 `display_node`；命令行 `--admin` / `--display-node` 只临时覆盖本次运行。
+- `admin_id`：运行态管理员字段，保存配置时会清空为 `null`，每次启动后通过局域网发现重新判定。
+- `topology`：运行态拓扑字段，保存配置时会清空为 `null`；每次启动后重新发现局域网主机并协商/手动设置邻居。
 
 ## 测试
 

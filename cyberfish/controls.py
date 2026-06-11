@@ -5,7 +5,7 @@ from typing import Any
 
 import pygame
 
-from .config import AppConfig
+from .config import AppConfig, ROLE_ADMIN, sanitize_role
 from .network import Peer
 
 
@@ -91,12 +91,30 @@ class ControlConsole:
         fish_count: int,
         paused: bool,
         status_message: str = "",
+        effective_role: str | None = None,
+        admin_id: str | None = None,
+        admin_conflict: bool = False,
+        admin_ack_status: dict[str, str] | None = None,
     ) -> None:
         # 每帧重建按钮列表，窗口缩放或在线主机数量变化后点击区域会自动跟随布局。
         self.buttons = []
         width, height = surface.get_size()
+        role = sanitize_role(effective_role or config.role)
+        if role != ROLE_ADMIN:
+            self._draw_display_status(
+                surface,
+                config=config,
+                peers=peers,
+                fps=fps,
+                fish_count=fish_count,
+                paused=paused,
+                admin_id=admin_id,
+                status_message=status_message,
+            )
+            return
+
         panel_width = min(420, max(330, width - 24))
-        panel_height = min(height - 24, 392)
+        panel_height = min(height - 24, 424)
         panel_rect = pygame.Rect(12, 12, panel_width, panel_height)
 
         panel = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
@@ -106,23 +124,34 @@ class ControlConsole:
 
         x = panel_rect.x + 14
         y = panel_rect.y + 10
-        self._draw_text(surface, "CyberFish 控制台", (x, y), self.title_font, (231, 250, 252))
+        run_text = self._run_status_text(config, peers, paused)
+        self._draw_text(surface, "CyberFish 管理员控制台", (x, y), self.title_font, (231, 250, 252))
         self._draw_text(
             surface,
-            f"帧率 {fps:4.1f}  鱼 {fish_count}  在线主机 {len(peers)}",
+            f"运行状态 {run_text}  帧率 {fps:4.1f}  鱼 {fish_count}  在线主机 {len(peers)}",
             (x, y + 24),
             self.small_font,
             (185, 228, 235),
         )
         self._draw_text(
             surface,
-            f"本机 {config.node_id}",
+            f"本机 {config.node_id}  管理员 {admin_id or '未确定'}",
             (x, y + 43),
             self.small_font,
             (185, 228, 235),
         )
+        if admin_conflict:
+            self._draw_text(
+                surface,
+                "检测到多个管理员，已按 node_id 选择唯一管理员",
+                (x, y + 62),
+                self.small_font,
+                (245, 196, 140),
+            )
 
         y += 68
+        if admin_conflict:
+            y += 18
         self._button_row(
             surface,
             x,
@@ -176,7 +205,14 @@ class ControlConsole:
         y += 28
         self._draw_text(surface, "选择在线主机", (x, y), self.font, (231, 250, 252))
         y += 24
-        peer_rects_bottom = self._draw_peer_buttons(surface, x, y, panel_rect.right - 14, peers, selected_peer)
+        peer_rects_bottom = self._draw_peer_buttons(
+            surface,
+            x,
+            y,
+            panel_rect.right - 14,
+            peers,
+            selected_peer,
+        )
         y = peer_rects_bottom + 12
 
         selected_label = selected_peer.node_id[:8] if selected_peer else "未选择"
@@ -199,6 +235,68 @@ class ControlConsole:
         if status_message:
             y += 36
             self._draw_text(surface, status_message, (x, y), self.small_font, (245, 196, 140))
+        if admin_ack_status:
+            y += 22 if status_message else 36
+            self._draw_text(
+                surface,
+                self._ack_summary(admin_ack_status),
+                (x, y),
+                self.small_font,
+                (185, 228, 235),
+            )
+
+    def _draw_display_status(
+        self,
+        surface: pygame.Surface,
+        *,
+        config: AppConfig,
+        peers: list[Peer],
+        fps: float,
+        fish_count: int,
+        paused: bool,
+        admin_id: str | None,
+        status_message: str,
+    ) -> None:
+        width, height = surface.get_size()
+        panel_width = min(400, max(300, width - 24))
+        panel_height = min(height - 24, 156)
+        panel_rect = pygame.Rect(12, 12, panel_width, panel_height)
+        panel = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
+        panel.fill((2, 18, 31, 172))
+        pygame.draw.rect(panel, (111, 210, 224, 100), panel.get_rect(), 1, border_radius=8)
+        surface.blit(panel, panel_rect)
+
+        x = panel_rect.x + 14
+        y = panel_rect.y + 10
+        admin_online = admin_id is not None and (
+            admin_id == config.node_id or any(peer.node_id == admin_id for peer in peers)
+        )
+        admin_text = "在线" if admin_online else "未连接"
+        run_text = self._run_status_text(config, peers, paused)
+        self._draw_text(surface, "CyberFish 演示节点", (x, y), self.title_font, (231, 250, 252))
+        self._draw_text(
+            surface,
+            f"帧率 {fps:4.1f}  鱼 {fish_count}  在线主机 {len(peers)}",
+            (x, y + 28),
+            self.small_font,
+            (185, 228, 235),
+        )
+        self._draw_text(
+            surface,
+            f"本机 {config.node_id}  运行状态 {run_text}",
+            (x, y + 50),
+            self.small_font,
+            (185, 228, 235),
+        )
+        self._draw_text(
+            surface,
+            f"管理员 {admin_id or '未确定'} ({admin_text})",
+            (x, y + 72),
+            self.small_font,
+            (185, 228, 235) if admin_online else (245, 196, 140),
+        )
+        if status_message:
+            self._draw_text(surface, status_message, (x, y + 102), self.small_font, (245, 196, 140))
 
     def handle_click(self, position: tuple[int, int]) -> ControlAction | None:
         # 后绘制的按钮优先命中，避免重叠区域触发被底层按钮抢走。
@@ -245,7 +343,8 @@ class ControlConsole:
         cursor_x = x
         cursor_y = y
         for index, peer in enumerate(peers):
-            label = f"{index + 1}. {peer.hostname[:12]} {peer.node_id[:8]}"
+            role = "管" if peer.is_admin else "演"
+            label = f"{index + 1}. {role} {peer.hostname[:10]} {peer.node_id[:8]}"
             rect = pygame.Rect(cursor_x, cursor_y, 184, 28)
             if rect.right > right and cursor_x != x:
                 # 在线主机过多时自动换行，控制台仍保留完整可点击区域。
@@ -323,3 +422,19 @@ class ControlConsole:
                 value = f"{peer_id[:8]}({marker})"
             parts.append(f"{label}:{value}")
         return "拓扑 " + "  ".join(parts)
+
+    @staticmethod
+    def _run_status_text(config: AppConfig, peers: list[Peer], paused: bool) -> str:
+        if not config.network_enabled or not peers:
+            return "未联机"
+        return "暂停" if paused else "运行中"
+
+    @staticmethod
+    def _ack_summary(admin_ack_status: dict[str, str]) -> str:
+        parts = [
+            f"{node_id[:8]}:{status}"
+            for node_id, status in sorted(admin_ack_status.items())[:2]
+        ]
+        if len(admin_ack_status) > 2:
+            parts.append(f"+{len(admin_ack_status) - 2}")
+        return "命令反馈 " + "  ".join(parts)

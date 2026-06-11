@@ -7,6 +7,8 @@ from pathlib import Path
 from cyberfish.config import (
     DIRECTIONS,
     AppConfig,
+    ROLE_ADMIN,
+    ROLE_DISPLAY_NODE,
     assign_peer_to_single_direction,
     load_config,
     save_config,
@@ -23,16 +25,59 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(set(config.topology), set(DIRECTIONS))
             self.assertGreaterEqual(config.fish_count, 1)
+            self.assertEqual(config.role, ROLE_DISPLAY_NODE)
+            self.assertIsNone(config.admin_id)
 
-    def test_save_and_reload_topology(self) -> None:
+    def test_invalid_role_falls_back_to_display_node(self) -> None:
+        config = AppConfig(node_id="node-a", role="operator")  # type: ignore[arg-type]
+        config.normalized()
+        self.assertEqual(config.role, ROLE_DISPLAY_NODE)
+
+    def test_load_config_ignores_stale_admin_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            path.write_text(
+                '{"node_id": "node-a", "role": "admin", "admin_id": "node-old"}',
+                encoding="utf-8",
+            )
+            config = load_config(path)
+            self.assertEqual(config.role, ROLE_ADMIN)
+            self.assertIsNone(config.admin_id)
+
+    def test_save_clears_topology_on_disk_without_mutating_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "config.json"
             config = AppConfig(node_id="node-a")
             config.topology["right"] = "node-b"
             save_config(path, config)
+            self.assertEqual(config.topology["right"], "node-b")
+
             loaded = load_config(path)
             self.assertEqual(loaded.node_id, "node-a")
-            self.assertEqual(loaded.topology["right"], "node-b")
+            self.assertTrue(all(value is None for value in loaded.topology.values()))
+
+    def test_load_config_ignores_stale_topology_from_previous_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            path.write_text(
+                """
+                {
+                  "node_id": "node-a",
+                  "topology": {
+                    "left": "node-old",
+                    "right": null,
+                    "up": null,
+                    "down": null
+                  }
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            loaded = load_config(path)
+
+            self.assertEqual(loaded.node_id, "node-a")
+            self.assertTrue(all(value is None for value in loaded.topology.values()))
 
     def test_peer_can_only_be_assigned_to_one_direction(self) -> None:
         config = AppConfig(node_id="node-a")

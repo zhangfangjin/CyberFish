@@ -6,6 +6,8 @@ from cyberfish.config import DIRECTIONS, INVERSE_DIRECTIONS, _default_topology
 from cyberfish.topology import (
     ASSIGNMENT_TIMEOUT_SECONDS,
     CONVERGENCE_QUIET_SECONDS,
+    LEGACY_NEGOTIATION_TYPE,
+    NEGOTIATION_TYPE,
     TopologyCoordinator,
 )
 
@@ -243,14 +245,22 @@ class MessageValidationTests(unittest.TestCase):
         coord = make_coordinator("node-a", clock)
         coord.on_claim("not a dict")
         coord.on_claim({"type": "hello", "node_id": "node-b"})
-        coord.on_claim({"type": "topology"})  # 缺 node_id
-        coord.on_claim({"type": "topology", "node_id": "node-a", "topology": {}})  # 本机
+        coord.on_claim({"type": NEGOTIATION_TYPE})  # 缺 node_id
+        coord.on_claim({"type": LEGACY_NEGOTIATION_TYPE, "node_id": "node-a", "topology": {}})  # 本机
         self.assertEqual(coord.peer_claims, {})
+
+    def test_standard_and_legacy_claim_messages_are_accepted(self) -> None:
+        clock = FakeClock()
+        coord = make_coordinator("node-a", clock)
+        coord.on_claim({"type": NEGOTIATION_TYPE, "node_id": "node-b", "topology": {"right": "node-a"}})
+        coord.on_claim({"type": LEGACY_NEGOTIATION_TYPE, "node_id": "node-c", "topology": {"left": "node-a"}})
+        self.assertIn("node-b", coord.peer_claims)
+        self.assertIn("node-c", coord.peer_claims)
 
     def test_self_message_ignored(self) -> None:
         clock = FakeClock()
         coord = make_coordinator("node-a", clock)
-        coord.on_claim({"type": "topology", "node_id": "node-a", "topology": {"right": "node-b"}})
+        coord.on_claim({"type": NEGOTIATION_TYPE, "node_id": "node-a", "topology": {"right": "node-b"}})
         self.assertNotIn("node-a", coord.peer_claims)
 
     def test_claim_message_within_datagram_limit(self) -> None:

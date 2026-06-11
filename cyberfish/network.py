@@ -7,12 +7,27 @@ import time
 from typing import Callable
 import uuid
 
+from .config import ROLE_ADMIN, ROLE_DISPLAY_NODE, sanitize_role
+
 
 DISCOVERY_TTL_SECONDS = 8.0
 TRANSFER_RETRY_SECONDS = 0.06
 TRANSFER_TIMEOUT_SECONDS = 0.75
 RECEIVED_TRANSFER_TTL_SECONDS = 20.0
 MAX_DATAGRAM_BYTES = 65507
+
+# FR-45..FR-51 标准网络消息类型。旧版小写类型只在接收路径兼容。
+DISCOVER = "DISCOVER"
+DISCOVER_RESPONSE = "DISCOVER_RESPONSE"
+HEARTBEAT = "HEARTBEAT"
+STATUS_SYNC = "STATUS_SYNC"
+NODE_JOIN = "NODE_JOIN"
+NODE_LEAVE = "NODE_LEAVE"
+TOPOLOGY_UPDATE = "TOPOLOGY_UPDATE"
+
+LEGACY_HELLO = "hello"
+LEGACY_FISH_STATE = "fish_state"
+LEGACY_TOPOLOGY = "topology"
 
 
 def detect_local_ip() -> str | None:
@@ -58,6 +73,18 @@ class Peer:
     port: int
     screen_size: tuple[int, int]
     last_seen: float
+    role: str = ROLE_DISPLAY_NODE
+    position_x: int | None = None
+    position_y: int | None = None
+    left_neighbor: str | None = None
+    right_neighbor: str | None = None
+    up_neighbor: str | None = None
+    down_neighbor: str | None = None
+    online_status: bool = True
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == ROLE_ADMIN
 
 
 @dataclass
@@ -76,9 +103,13 @@ class PendingTransfer:
 class NetworkEvents:
     transfers: list[dict] = field(default_factory=list)
     expired_transfers: list[dict] = field(default_factory=list)
+    fish_states: list[dict] = field(default_factory=list)
     discovered: list[Peer] = field(default_factory=list)
+    left_node_ids: list[str] = field(default_factory=list)
     acked_transfer_ids: list[str] = field(default_factory=list)
     topology_claims: list[dict] = field(default_factory=list)
+    admin_commands: list[dict] = field(default_factory=list)
+    admin_acks: list[dict] = field(default_factory=list)
     # 检测到与本机相同 node_id 但来自其它主机的报文时置 True（node_id 冲突）。
     node_id_conflict: bool = False
 
@@ -96,6 +127,7 @@ class NetworkManager:
         bind_host: str = "",
         hostname: str | None = None,
         screen_size: tuple[int, int] = (0, 0),
+        role: str = ROLE_DISPLAY_NODE,
         now_func: Callable[[], float] = time.monotonic,
     ) -> None:
         self.node_id = node_id
@@ -105,10 +137,12 @@ class NetworkManager:
         self.bind_host = bind_host
         self.hostname = hostname or socket.gethostname()
         self.screen_size = screen_size
+        self.role = sanitize_role(role)
         self.now = now_func
         self.peers: dict[str, Peer] = {}
         self.pending_transfers: dict[str, PendingTransfer] = {}
         self._received_transfers: dict[str, float] = {}
+        self._fish_state_sequence = 0
         # 单个非阻塞 UDP socket 同时承担发现广播和点对点移交，主循环可每帧 poll。
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -132,6 +166,16 @@ class NetworkManager:
         self.stats: dict[str, int] = {
             "hello_sent": 0,
             "hello_recv": 0,
+            "discover_sent": 0,
+            "discover_recv": 0,
+            "discover_response_sent": 0,
+            "discover_response_recv": 0,
+            "heartbeat_sent": 0,
+            "heartbeat_recv": 0,
+            "node_join_sent": 0,
+            "node_join_recv": 0,
+            "node_leave_sent": 0,
+            "node_leave_recv": 0,
             "datagrams_recv": 0,
             "transfer_sent": 0,
             "transfer_recv": 0,
@@ -139,6 +183,12 @@ class NetworkManager:
             "ack_recv": 0,
             "transfer_expired": 0,
             "send_errors": 0,
+            "admin_cmd_sent": 0,
+            "admin_cmd_recv": 0,
+            "admin_ack_sent": 0,
+            "admin_ack_recv": 0,
+            "fish_state_sent": 0,
+            "fish_state_recv": 0,
         }
 
     def _build_broadcast_targets(self) -> list[str]:
@@ -169,40 +219,117 @@ class NetworkManager:
     def address(self) -> tuple[str, int]:
         return self._socket.getsockname()
 
-    def close(self) -> None:
+    def close(self, *, announce: bool = True) -> None:
+        if announce:
+            self.send_node_leave()
         self._socket.close()
 
     def update_screen_size(self, screen_size: tuple[int, int]) -> None:
         self.screen_size = screen_size
 
+    def set_role(self, role: str) -> None:
+        self.role = sanitize_role(role)
+
     def send_hello(self) -> None:
-        self._broadcast(self._hello_message())
+        self._broadcast(self._node_presence_message(DISCOVER))
         self.stats["hello_sent"] += 1
+        self.stats["discover_sent"] += 1
 
     def send_hello_to(self, address: tuple[str, int]) -> None:
-        self._send_message(self._hello_message(), address)
+        self._send_message(self._node_presence_message(DISCOVER), address)
 
-    def send_fish_state(self, fish_count: int, sample: list[dict] | None = None) -> None:
+    def send_heartbeat(self) -> None:
+        self._broadcast(self._node_presence_message(HEARTBEAT))
+        self.stats["heartbeat_sent"] += 1
+
+    def send_node_join(self) -> None:
+        self._broadcast(self._node_presence_message(NODE_JOIN))
+        self.stats["node_join_sent"] += 1
+
+    def send_node_leave(self) -> None:
+        self._broadcast(self._node_presence_message(NODE_LEAVE))
+        self.stats["node_leave_sent"] += 1
+
+    def send_fish_state(self, fish_count: int, fishes: list[dict] | None = None) -> int:
+        self._fish_state_sequence += 1
         message = {
-            "type": "fish_state",
+            "type": STATUS_SYNC,
+            "version": 2,
             "node_id": self.node_id,
+            "role": self.role,
             "sent_at": self.now(),
+            "sequence": self._fish_state_sequence,
+            "screen_size": [self.screen_size[0], self.screen_size[1]],
             "fish_count": fish_count,
-            "sample": sample or [],
+            "fishes": fishes or [],
         }
         self._broadcast(message)
+        self.stats["fish_state_sent"] += 1
+        return self._fish_state_sequence
 
     def send_topology_claim(self, message: dict) -> None:
         """广播一条拓扑协商消息（Negotiation_Message，Requirement 11.1/11.5）。"""
         payload = dict(message)
+        payload["type"] = TOPOLOGY_UPDATE
         payload["node_id"] = self.node_id
+        payload["role"] = self.role
         self._broadcast(payload)
+
+    def send_admin_command(
+        self,
+        action: str,
+        payload: dict | None = None,
+        *,
+        target: str = "all",
+    ) -> str:
+        command_id = f"{self.node_id}-{uuid.uuid4().hex}"
+        message = {
+            "type": "admin_command",
+            "node_id": self.node_id,
+            "role": self.role,
+            "admin_id": self.node_id,
+            "command_id": command_id,
+            "target": target,
+            "action": action,
+            "payload": payload or {},
+            "sent_at": self.now(),
+        }
+        if target != "all" and (peer := self.get_peer(target)):
+            self._send_message(message, (peer.address, peer.port))
+        else:
+            self._broadcast(message)
+        self.stats["admin_cmd_sent"] += 1
+        return command_id
+
+    def send_admin_ack(
+        self,
+        address: tuple[str, int],
+        command_id: str,
+        *,
+        ok: bool,
+        message: str,
+    ) -> None:
+        self._send_message(
+            {
+                "type": "admin_ack",
+                "node_id": self.node_id,
+                "role": self.role,
+                "target_admin_id": None,
+                "command_id": command_id,
+                "ok": bool(ok),
+                "message": message,
+                "sent_at": self.now(),
+            },
+            address,
+        )
+        self.stats["admin_ack_sent"] += 1
 
     def send_fish_transfer(self, peer: Peer, fish_payload: dict) -> str:
         transfer_id = f"{self.node_id}-{uuid.uuid4().hex}"
         message = {
             "type": "fish_transfer",
             "node_id": self.node_id,
+            "role": self.role,
             "target_node_id": peer.node_id,
             "transfer_id": transfer_id,
             "sent_at": self.now(),
@@ -253,24 +380,32 @@ class NetworkManager:
         lines = [
             f"本机IP {self.local_ip or '?'}  端口 {self.listen_port}",
             f"广播目标 {', '.join(self.broadcast_targets)}",
-            f"在线 {len(peers)}  hello发/收 {s['hello_sent']}/{s['hello_recv']}",
+            f"在线 {len(peers)}  发现发/收 {s['discover_sent']}/{s['discover_recv']}  响应发/收 {s['discover_response_sent']}/{s['discover_response_recv']}",
+            f"心跳发/收 {s['heartbeat_sent']}/{s['heartbeat_recv']}  加入/退出收 {s['node_join_recv']}/{s['node_leave_recv']}",
             f"收包总数 {s['datagrams_recv']}  发送错误 {s['send_errors']}",
             f"鱼发出/确认 {s['transfer_sent']}/{s['ack_recv']}  超时 {s['transfer_expired']}",
             f"鱼收到/回ack {s['transfer_recv']}/{s['ack_sent']}",
+            f"状态同步 发/收 {s['fish_state_sent']}/{s['fish_state_recv']}",
+            f"管理命令 发/收 {s['admin_cmd_sent']}/{s['admin_cmd_recv']}  ACK 发/收 {s['admin_ack_sent']}/{s['admin_ack_recv']}",
         ]
         for peer in peers:
-            lines.append(f"  · {peer.hostname[:14]} {peer.node_id[:8]} @ {peer.address}:{peer.port}")
+            role = "管理员" if peer.is_admin else "演示"
+            lines.append(f"  · {role} {peer.hostname[:12]} {peer.node_id[:8]} @ {peer.address}:{peer.port}")
         return lines
 
-    def _hello_message(self) -> dict:
+    def _node_presence_message(self, message_type: str) -> dict:
         return {
-            "type": "hello",
+            "type": message_type,
             "node_id": self.node_id,
+            "role": self.role,
             "hostname": self.hostname,
             "port": self.listen_port,
             "screen_size": [self.screen_size[0], self.screen_size[1]],
             "sent_at": self.now(),
         }
+
+    def _hello_message(self) -> dict:
+        return self._node_presence_message(DISCOVER)
 
     def _handle_datagram(
         self,
@@ -298,9 +433,22 @@ class NetworkManager:
 
         message_type = message.get("type")
         # 所有协议消息都用 type 分发；未知消息直接忽略，保证版本不一致时仍稳定。
-        if message_type == "hello":
+        if message_type in (DISCOVER, LEGACY_HELLO):
             self.stats["hello_recv"] += 1
-            self._handle_hello(message, address, events)
+            self.stats["discover_recv"] += 1
+            self._handle_discover(message, address, events)
+        elif message_type == DISCOVER_RESPONSE:
+            self.stats["discover_response_recv"] += 1
+            self._handle_node_presence(message, address, events)
+        elif message_type == HEARTBEAT:
+            self.stats["heartbeat_recv"] += 1
+            self._handle_node_presence(message, address, events)
+        elif message_type == NODE_JOIN:
+            self.stats["node_join_recv"] += 1
+            self._handle_node_presence(message, address, events)
+        elif message_type == NODE_LEAVE:
+            self.stats["node_leave_recv"] += 1
+            self._handle_node_leave(message, events)
         elif message_type == "fish_transfer":
             self.stats["transfer_recv"] += 1
             self._handle_fish_transfer(message, address, events)
@@ -308,11 +456,17 @@ class NetworkManager:
             self.stats["ack_recv"] += 1
             self._handle_transfer_ack(message, events)
             self._register_peer_from_message(message, address, events)
-        elif message_type == "fish_state":
+        elif message_type in (STATUS_SYNC, LEGACY_FISH_STATE):
             self._handle_fish_state(message, address, events)
-        elif message_type == "topology":
+        elif message_type in (TOPOLOGY_UPDATE, LEGACY_TOPOLOGY):
             events.topology_claims.append(message)
             self._register_peer_from_message(message, address, events)
+        elif message_type == "admin_command":
+            self.stats["admin_cmd_recv"] += 1
+            self._handle_admin_command(message, address, events)
+        elif message_type == "admin_ack":
+            self.stats["admin_ack_recv"] += 1
+            self._handle_admin_ack(message, address, events)
 
     def _register_peer(
         self,
@@ -323,12 +477,13 @@ class NetworkManager:
         port: int | None = None,
         hostname: str | None = None,
         screen_size: tuple[int, int] | None = None,
+        role: str | None = None,
     ) -> bool:
         """登记或刷新一个 Peer，返回是否为新发现。
 
-        任何携带 node_id 的报文都会让对端被登记，使得即便某一方向的广播不可达
-        （例如 Windows 多网卡只从虚拟网卡发出 255.255.255.255），也能通过收到的
-        单播报文学习到对端，从而补全双向发现。
+        任何携带 node_id 的报文都会让对端被登记，使得即便某一方向的广播不可达，
+        也能通过收到的单播报文学习到对端。DISCOVER 的反向确认由
+        _handle_discover() 单独发送 DISCOVER_RESPONSE。
         """
         if not node_id or node_id == self.node_id:
             return False
@@ -341,13 +496,19 @@ class NetworkManager:
             screen_size=screen_size
             or (existing.screen_size if existing else (0, 0)),
             last_seen=self.now(),
+            role=sanitize_role(role if role is not None else (existing.role if existing else ROLE_DISPLAY_NODE)),
+            position_x=existing.position_x if existing else None,
+            position_y=existing.position_y if existing else None,
+            left_neighbor=existing.left_neighbor if existing else None,
+            right_neighbor=existing.right_neighbor if existing else None,
+            up_neighbor=existing.up_neighbor if existing else None,
+            down_neighbor=existing.down_neighbor if existing else None,
+            online_status=True,
         )
         is_new = existing is None
         self.peers[node_id] = peer
         if is_new:
             events.discovered.append(peer)
-            # 发现新对端后立即单播回一条 hello，确保反向发现不依赖广播可达性。
-            self.send_hello_to((peer.address, peer.port))
         return is_new
 
     def _register_peer_from_message(
@@ -358,17 +519,34 @@ class NetworkManager:
     ) -> None:
         node_id = str(message.get("node_id") or "")
         if node_id:
-            self._register_peer(node_id, address, events)
+            self._register_peer(
+                node_id,
+                address,
+                events,
+                role=str(message.get("role") or "") if message.get("role") is not None else None,
+            )
 
-    def _handle_hello(
+    def _handle_discover(
         self,
         message: dict,
         address: tuple[str, int],
         events: NetworkEvents,
     ) -> None:
+        response_address = self._handle_node_presence(message, address, events)
+        if response_address is None:
+            return
+        self._send_message(self._node_presence_message(DISCOVER_RESPONSE), response_address)
+        self.stats["discover_response_sent"] += 1
+
+    def _handle_node_presence(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> tuple[str, int] | None:
         node_id = str(message.get("node_id") or "")
         if not node_id:
-            return
+            return None
         port = int(message.get("port") or address[1])
         screen_size = message.get("screen_size") or [0, 0]
         try:
@@ -382,7 +560,24 @@ class NetworkManager:
             port=port,
             hostname=str(message.get("hostname") or node_id),
             screen_size=size,
+            role=str(message.get("role") or ""),
         )
+        return (address[0], port)
+
+    def _handle_hello(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        self._handle_discover(message, address, events)
+
+    def _handle_node_leave(self, message: dict, events: NetworkEvents) -> None:
+        node_id = str(message.get("node_id") or "")
+        if not node_id:
+            return
+        if self.peers.pop(node_id, None) is not None:
+            events.left_node_ids.append(node_id)
 
     def _handle_fish_state(
         self,
@@ -390,7 +585,27 @@ class NetworkManager:
         address: tuple[str, int],
         events: NetworkEvents,
     ) -> None:
-        self._register_peer_from_message(message, address, events)
+        self.stats["fish_state_recv"] += 1
+        screen_size = message.get("screen_size") or [0, 0]
+        try:
+            size = (int(screen_size[0]), int(screen_size[1]))
+        except (TypeError, ValueError, IndexError):
+            size = (0, 0)
+        node_id = str(message.get("node_id") or "")
+        if node_id:
+            self._register_peer(
+                node_id,
+                address,
+                events,
+                screen_size=size,
+                role=str(message.get("role") or "") if message.get("role") is not None else None,
+            )
+        # 旧版 fish_state 只有 sample，不能作为完整同步源；只用于刷新 peer。
+        if message.get("version") != 2 or not isinstance(message.get("fishes"), list):
+            return
+        event = dict(message)
+        event["screen_size"] = [size[0], size[1]]
+        events.fish_states.append(event)
 
     def _handle_fish_transfer(
         self,
@@ -406,13 +621,14 @@ class NetworkManager:
             return
 
         # 收到鱼移交说明对端能单播到本机；登记其地址以补全反向发现
-        # （即便对端的广播 hello 到不了本机）。
+        # （即便对端的广播 DISCOVER 到不了本机）。
         self._register_peer_from_message(message, address, events)
 
         self._send_message(
             {
                 "type": "transfer_ack",
                 "node_id": self.node_id,
+                "role": self.role,
                 "target_node_id": message.get("node_id"),
                 "transfer_id": transfer_id,
                 "sent_at": self.now(),
@@ -425,6 +641,38 @@ class NetworkManager:
             return
         self._received_transfers[transfer_id] = self.now()
         events.transfers.append(fish_payload)
+
+    def _handle_admin_command(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        self._register_peer_from_message(message, address, events)
+        target = str(message.get("target") or "all")
+        if target not in ("all", self.node_id):
+            return
+        command_id = str(message.get("command_id") or "")
+        action = str(message.get("action") or "")
+        if not command_id or not action:
+            return
+        payload = message.get("payload")
+        event = dict(message)
+        event["payload"] = payload if isinstance(payload, dict) else {}
+        event["_address"] = address
+        events.admin_commands.append(event)
+
+    def _handle_admin_ack(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        self._register_peer_from_message(message, address, events)
+        command_id = str(message.get("command_id") or "")
+        if not command_id:
+            return
+        events.admin_acks.append(dict(message))
 
     def _handle_transfer_ack(self, message: dict, events: NetworkEvents) -> None:
         if message.get("target_node_id") != self.node_id:
@@ -452,7 +700,7 @@ class NetworkManager:
 
     def _drop_stale_peers(self) -> None:
         now = self.now()
-        # hello 超过 TTL 未刷新即视为离线，拓扑层会在下一轮释放相关方向。
+        # HEARTBEAT/节点存在消息超过 TTL 未刷新即视为离线，拓扑层会在下一轮释放相关方向。
         stale = [
             node_id
             for node_id, peer in self.peers.items()

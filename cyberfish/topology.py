@@ -32,8 +32,9 @@ from .config import DIRECTIONS, INVERSE_DIRECTIONS, sanitize_topology
 ASSIGNMENT_TIMEOUT_SECONDS = 10.0
 # Convergence 判定所需的「安静期」：相邻关系连续无变更（Requirement 3.2）。
 CONVERGENCE_QUIET_SECONDS = 5.0
-# 协商消息的类型标识。
-NEGOTIATION_TYPE = "topology"
+# 协商消息的标准类型标识；旧版 "topology" 仅作为接收兼容。
+NEGOTIATION_TYPE = "TOPOLOGY_UPDATE"
+LEGACY_NEGOTIATION_TYPE = "topology"
 
 
 @dataclass
@@ -143,7 +144,7 @@ class TopologyCoordinator:
         """
         if not isinstance(message, dict):
             return
-        if message.get("type") != NEGOTIATION_TYPE:
+        if message.get("type") not in (NEGOTIATION_TYPE, LEGACY_NEGOTIATION_TYPE):
             return
         sender = message.get("node_id")
         if not isinstance(sender, str) or not sender:

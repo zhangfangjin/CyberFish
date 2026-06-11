@@ -87,13 +87,95 @@ class FishTests(unittest.TestCase):
             color=(1, 2, 3),
             depth=0.7,
             phase=1.5,
+            current_node_id="node-a",
         )
         payload = fish.to_transfer_payload("right", (800, 600))
         incoming = Fish.from_transfer_payload(payload, (1024, 768))
+        self.assertEqual(payload["fishId"], "f1")
+        self.assertEqual(payload["currentNodeId"], "node-a")
+        self.assertEqual(payload["animationState"], "transferring")
+        self.assertTrue(payload["isTransferring"])
         self.assertEqual(incoming.fish_id, "f1")
+        self.assertIsNone(incoming.current_node_id)
+        self.assertEqual(incoming.animation_state, "swimming")
+        self.assertFalse(incoming.is_transferring)
         self.assertLess(incoming.position.x, 0)
         self.assertAlmostEqual(incoming.position.y, 384, delta=1.0)
         self.assertGreater(incoming.velocity.x, 0)
+
+    def test_full_state_payload_round_trip_preserves_motion_and_animation_fields(self) -> None:
+        fish = Fish(
+            fish_id="state-fish",
+            position=pygame.Vector2(850, -30),
+            velocity=pygame.Vector2(123.4567, -8.5),
+            size=50,
+            color=(1, 2, 3),
+            depth=0.7,
+            phase=1.23456,
+            age=2.0,
+            wander_angle=0.4,
+            wander_jitter=0.5,
+            turn_bias=0.1,
+            target_interval=3.0,
+            wander_timer=1.2,
+            turn_progress=0.2,
+            turn_duration=0.55,
+            turn_start_angle=0.1,
+            turn_end_angle=3.2,
+            turn_direction=-1,
+            turn_cooldown=0.8,
+            current_node_id="node-a",
+        )
+
+        payload = fish.to_state_payload((800, 600))
+        restored = Fish.from_state_payload(payload, (800, 600))
+
+        self.assertEqual(payload["fishId"], "state-fish")
+        self.assertEqual(payload["currentNodeId"], "node-a")
+        self.assertEqual(payload["direction"], "right")
+        self.assertAlmostEqual(payload["speed"], fish.speed, delta=0.01)
+        self.assertEqual(payload["animationState"], "turning")
+        self.assertFalse(payload["isTransferring"])
+        self.assertGreater(payload["p"][0], 1.0)
+        self.assertLess(payload["p"][1], 0.0)
+        self.assertEqual(restored.fish_id, "state-fish")
+        self.assertEqual(restored.current_node_id, "node-a")
+        self.assertEqual(restored.animation_state, "turning")
+        self.assertFalse(restored.is_transferring)
+        self.assertAlmostEqual(restored.position.x, 850, delta=0.1)
+        self.assertAlmostEqual(restored.position.y, -30, delta=0.1)
+        self.assertAlmostEqual(restored.velocity.x, 123.4567, delta=0.01)
+        self.assertAlmostEqual(restored.velocity.y, -8.5, delta=0.01)
+        self.assertEqual(restored.color, (1, 2, 3))
+        self.assertAlmostEqual(restored.size, 50)
+        self.assertAlmostEqual(restored.depth, 0.7)
+        self.assertAlmostEqual(restored.phase, 1.23456, delta=0.01)
+        self.assertAlmostEqual(restored.wander_angle, 0.4)
+        self.assertAlmostEqual(restored.wander_jitter, 0.5)
+        self.assertAlmostEqual(restored.turn_bias, 0.1)
+        self.assertAlmostEqual(restored.target_interval, 3.0)
+        self.assertAlmostEqual(restored.turn_progress, 0.2)
+        self.assertAlmostEqual(restored.turn_duration, 0.55)
+        self.assertEqual(restored.turn_direction, -1)
+
+    def test_legacy_state_payload_defaults_new_fields(self) -> None:
+        payload = {
+            "id": "legacy",
+            "p": [0.25, 0.5],
+            "v": [-30, 90],
+            "s": 44,
+            "c": [1, 2, 3],
+            "d": 0.4,
+        }
+
+        fish = Fish.from_state_payload(payload, (800, 600))
+
+        self.assertEqual(fish.fish_id, "legacy")
+        self.assertIsNone(fish.current_node_id)
+        self.assertEqual(fish.animation_state, "swimming")
+        self.assertFalse(fish.is_transferring)
+        self.assertEqual(fish.direction, "down")
+        self.assertAlmostEqual(fish.speed, pygame.Vector2(-30, 90).length())
 
     def test_incoming_transfer_is_not_bounced_back_out(self) -> None:
         outgoing = Fish(
