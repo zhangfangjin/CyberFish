@@ -56,6 +56,23 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(loaded.node_id, "node-a")
             self.assertTrue(all(value is None for value in loaded.topology.values()))
 
+    def test_confirmed_manual_topology_is_cached_for_database_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "config.json"
+            config = AppConfig(
+                node_id="node-a",
+                auto_topology=False,
+                managed_config_version=4,
+                manual_topology_version="topology-1",
+            )
+            config.topology["right"] = "node-b"
+            save_config(path, config)
+
+            loaded = load_config(path)
+            self.assertEqual(loaded.managed_config_version, 4)
+            self.assertEqual(loaded.manual_topology_version, "topology-1")
+            self.assertEqual(loaded.topology["right"], "node-b")
+
     def test_load_config_ignores_stale_topology_from_previous_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "config.json"

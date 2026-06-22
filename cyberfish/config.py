@@ -76,6 +76,10 @@ class AppConfig:
     auto_topology: bool = True
     role: str = ROLE_DISPLAY_NODE
     admin_id: str | None = None
+    # MySQL 管理配置的最后成功版本；0 表示尚未连接过数据库。
+    managed_config_version: int = 0
+    # 仅手动拓扑会缓存版本和邻接关系，自动拓扑每次启动重新协商。
+    manual_topology_version: str | None = None
     topology: dict[str, str | None] = field(default_factory=_default_topology)
 
     def normalized(self) -> "AppConfig":
@@ -90,6 +94,8 @@ class AppConfig:
             self.auto_topology = True
         self.role = sanitize_role(self.role)
         self.admin_id = sanitize_optional_node_id(self.admin_id)
+        self.managed_config_version = max(0, int(self.managed_config_version))
+        self.manual_topology_version = sanitize_optional_node_id(self.manual_topology_version)
         # 原地更新 topology，保持外部（如 TopologyCoordinator）持有的引用有效。
         sanitized = sanitize_topology(self.topology)
         if isinstance(self.topology, dict):
@@ -106,8 +112,12 @@ class AppConfig:
 def _merge_defaults(raw: dict) -> dict:
     defaults = AppConfig().to_dict()
     merged = defaults | raw
-    # 拓扑关系每次启动都重新发现/协商，不继承上次运行写入的邻居。
-    merged["topology"] = _default_topology()
+    # 只有 MySQL 已确认的手动拓扑允许作为离线缓存恢复；自动拓扑仍每次重算。
+    if not (
+        raw.get("auto_topology") is False
+        and sanitize_optional_node_id(raw.get("manual_topology_version"))
+    ):
+        merged["topology"] = _default_topology()
     # 管理员身份是局域网运行态，每次启动由发现消息重新判定。
     merged["admin_id"] = None
     return merged
@@ -141,8 +151,9 @@ def load_config(path: Path) -> AppConfig:
 
 def _persistent_payload(config: AppConfig) -> dict:
     payload = config.normalized().to_dict()
-    # 只清除写盘内容，不改 config.topology 本身；运行中的拓扑仍用于跨屏移交。
-    payload["topology"] = _default_topology()
+    # 自动拓扑和未被 MySQL 确认的手动拓扑不写盘；已确认手动拓扑作为故障缓存。
+    if config.auto_topology or not config.manual_topology_version:
+        payload["topology"] = _default_topology()
     # admin_id 是当前运行态发现结果，不写入配置文件。
     payload["admin_id"] = None
     return payload

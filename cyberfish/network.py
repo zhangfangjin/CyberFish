@@ -24,6 +24,9 @@ STATUS_SYNC = "STATUS_SYNC"
 NODE_JOIN = "NODE_JOIN"
 NODE_LEAVE = "NODE_LEAVE"
 TOPOLOGY_UPDATE = "TOPOLOGY_UPDATE"
+CONFIG_SNAPSHOT = "CONFIG_SNAPSHOT"
+CONFIG_ACK = "CONFIG_ACK"
+NODE_METRICS = "NODE_METRICS"
 
 LEGACY_HELLO = "hello"
 LEGACY_FISH_STATE = "fish_state"
@@ -81,6 +84,8 @@ class Peer:
     up_neighbor: str | None = None
     down_neighbor: str | None = None
     online_status: bool = True
+    boot_id: str | None = None
+    applied_config_version: int = 0
 
     @property
     def is_admin(self) -> bool:
@@ -110,6 +115,9 @@ class NetworkEvents:
     topology_claims: list[dict] = field(default_factory=list)
     admin_commands: list[dict] = field(default_factory=list)
     admin_acks: list[dict] = field(default_factory=list)
+    config_snapshots: list[dict] = field(default_factory=list)
+    config_acks: list[dict] = field(default_factory=list)
+    node_metrics: list[dict] = field(default_factory=list)
     # 检测到与本机相同 node_id 但来自其它主机的报文时置 True（node_id 冲突）。
     node_id_conflict: bool = False
 
@@ -128,6 +136,8 @@ class NetworkManager:
         hostname: str | None = None,
         screen_size: tuple[int, int] = (0, 0),
         role: str = ROLE_DISPLAY_NODE,
+        boot_id: str | None = None,
+        applied_config_version: int = 0,
         now_func: Callable[[], float] = time.monotonic,
     ) -> None:
         self.node_id = node_id
@@ -138,11 +148,14 @@ class NetworkManager:
         self.hostname = hostname or socket.gethostname()
         self.screen_size = screen_size
         self.role = sanitize_role(role)
+        self.boot_id = boot_id or str(uuid.uuid4())
+        self.applied_config_version = max(0, int(applied_config_version))
         self.now = now_func
         self.peers: dict[str, Peer] = {}
         self.pending_transfers: dict[str, PendingTransfer] = {}
         self._received_transfers: dict[str, float] = {}
         self._fish_state_sequence = 0
+        self._metric_sequence = 0
         # 单个非阻塞 UDP socket 同时承担发现广播和点对点移交，主循环可每帧 poll。
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -189,6 +202,12 @@ class NetworkManager:
             "admin_ack_recv": 0,
             "fish_state_sent": 0,
             "fish_state_recv": 0,
+            "config_sent": 0,
+            "config_recv": 0,
+            "config_ack_sent": 0,
+            "config_ack_recv": 0,
+            "metrics_sent": 0,
+            "metrics_recv": 0,
         }
 
     def _build_broadcast_targets(self) -> list[str]:
@@ -229,6 +248,9 @@ class NetworkManager:
 
     def set_role(self, role: str) -> None:
         self.role = sanitize_role(role)
+
+    def set_applied_config_version(self, version: int) -> None:
+        self.applied_config_version = max(0, int(version))
 
     def send_hello(self) -> None:
         self._broadcast(self._node_presence_message(DISCOVER))
@@ -275,6 +297,76 @@ class NetworkManager:
         payload["role"] = self.role
         self._broadcast(payload)
 
+    def send_config_snapshot(self, peer: Peer, config: dict) -> None:
+        message = {
+            "type": CONFIG_SNAPSHOT,
+            "version": 1,
+            "node_id": self.node_id,
+            "role": self.role,
+            "target_node_id": peer.node_id,
+            "config": config,
+            "sent_at": self.now(),
+        }
+        self._send_message(message, (peer.address, peer.port))
+        self.stats["config_sent"] += 1
+
+    def send_config_ack(
+        self,
+        address: tuple[str, int],
+        target_admin_id: str,
+        config_version: int,
+        *,
+        ok: bool,
+        message: str,
+        node_config: dict | None = None,
+    ) -> None:
+        self._send_message(
+            {
+                "type": CONFIG_ACK,
+                "version": 1,
+                "node_id": self.node_id,
+                "role": self.role,
+                "target_node_id": target_admin_id,
+                "config_version": max(0, int(config_version)),
+                "ok": bool(ok),
+                "message": str(message)[:255],
+                "node": node_config or {},
+                "sent_at": self.now(),
+            },
+            address,
+        )
+        self.stats["config_ack_sent"] += 1
+
+    def send_node_metrics(self, fish_count: int, fps: float) -> int:
+        self._metric_sequence = getattr(self, "_metric_sequence", 0) + 1
+        message = {
+            "type": NODE_METRICS,
+            "version": 1,
+            "node_id": self.node_id,
+            "role": self.role,
+            "boot_id": getattr(self, "boot_id", ""),
+            "sequence": self._metric_sequence,
+            "applied_config_version": getattr(self, "applied_config_version", 0),
+            "fish_count": max(0, int(fish_count)),
+            "fps": max(0.0, round(float(fps), 3)),
+            "counters": {
+                key: int(self.stats.get(key, 0))
+                for key in (
+                    "transfer_sent",
+                    "transfer_recv",
+                    "ack_recv",
+                    "transfer_expired",
+                    "datagrams_recv",
+                    "send_errors",
+                )
+            },
+            "sent_at": self.now(),
+        }
+        # 指标广播可让当前选出的管理员在角色变化后立即接管聚合。
+        self._broadcast(message)
+        self.stats["metrics_sent"] += 1
+        return self._metric_sequence
+
     def send_admin_command(
         self,
         action: str,
@@ -293,6 +385,8 @@ class NetworkManager:
             "action": action,
             "payload": payload or {},
             "sent_at": self.now(),
+            "boot_id": getattr(self, "boot_id", ""),
+            "applied_config_version": getattr(self, "applied_config_version", 0),
         }
         if target != "all" and (peer := self.get_peer(target)):
             self._send_message(message, (peer.address, peer.port))
@@ -402,6 +496,8 @@ class NetworkManager:
             "port": self.listen_port,
             "screen_size": [self.screen_size[0], self.screen_size[1]],
             "sent_at": self.now(),
+            "boot_id": getattr(self, "boot_id", ""),
+            "applied_config_version": getattr(self, "applied_config_version", 0),
         }
 
     def _hello_message(self) -> dict:
@@ -467,6 +563,15 @@ class NetworkManager:
         elif message_type == "admin_ack":
             self.stats["admin_ack_recv"] += 1
             self._handle_admin_ack(message, address, events)
+        elif message_type == CONFIG_SNAPSHOT:
+            self.stats["config_recv"] += 1
+            self._handle_config_snapshot(message, address, events)
+        elif message_type == CONFIG_ACK:
+            self.stats["config_ack_recv"] += 1
+            self._handle_config_ack(message, address, events)
+        elif message_type == NODE_METRICS:
+            self.stats["metrics_recv"] += 1
+            self._handle_node_metrics(message, address, events)
 
     def _register_peer(
         self,
@@ -478,6 +583,8 @@ class NetworkManager:
         hostname: str | None = None,
         screen_size: tuple[int, int] | None = None,
         role: str | None = None,
+        boot_id: str | None = None,
+        applied_config_version: int | None = None,
     ) -> bool:
         """登记或刷新一个 Peer，返回是否为新发现。
 
@@ -504,6 +611,15 @@ class NetworkManager:
             up_neighbor=existing.up_neighbor if existing else None,
             down_neighbor=existing.down_neighbor if existing else None,
             online_status=True,
+            boot_id=boot_id or (existing.boot_id if existing else None),
+            applied_config_version=max(
+                0,
+                int(
+                    applied_config_version
+                    if applied_config_version is not None
+                    else (existing.applied_config_version if existing else 0)
+                ),
+            ),
         )
         is_new = existing is None
         self.peers[node_id] = peer
@@ -524,6 +640,12 @@ class NetworkManager:
                 address,
                 events,
                 role=str(message.get("role") or "") if message.get("role") is not None else None,
+                boot_id=str(message.get("boot_id") or "") or None,
+                applied_config_version=(
+                    int(message.get("applied_config_version", 0))
+                    if message.get("applied_config_version") is not None
+                    else None
+                ),
             )
 
     def _handle_discover(
@@ -561,6 +683,8 @@ class NetworkManager:
             hostname=str(message.get("hostname") or node_id),
             screen_size=size,
             role=str(message.get("role") or ""),
+            boot_id=str(message.get("boot_id") or "") or None,
+            applied_config_version=int(message.get("applied_config_version", 0)),
         )
         return (address[0], port)
 
@@ -673,6 +797,43 @@ class NetworkManager:
         if not command_id:
             return
         events.admin_acks.append(dict(message))
+
+    def _handle_config_snapshot(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        if message.get("target_node_id") not in (None, self.node_id):
+            return
+        if not isinstance(message.get("config"), dict):
+            return
+        self._register_peer_from_message(message, address, events)
+        event = dict(message)
+        event["_address"] = address
+        events.config_snapshots.append(event)
+
+    def _handle_config_ack(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        if message.get("target_node_id") != self.node_id:
+            return
+        self._register_peer_from_message(message, address, events)
+        events.config_acks.append(dict(message))
+
+    def _handle_node_metrics(
+        self,
+        message: dict,
+        address: tuple[str, int],
+        events: NetworkEvents,
+    ) -> None:
+        if not isinstance(message.get("counters"), dict):
+            return
+        self._register_peer_from_message(message, address, events)
+        events.node_metrics.append(dict(message))
 
     def _handle_transfer_ack(self, message: dict, events: NetworkEvents) -> None:
         if message.get("target_node_id") != self.node_id:

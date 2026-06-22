@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 import random
+import socket
 import time
+import uuid
 
 import pygame
 
@@ -22,11 +24,21 @@ from .controls import ControlAction
 from .fish import ANIMATION_TRANSFERRING, Fish, create_random_fish
 from .network import NetworkManager, Peer
 from .renderer import AquariumRenderer
+from .storage import (
+    ConfigSnapshot,
+    DatabaseService,
+    MetricReport,
+    MySQLSettings,
+    NodeOverride,
+    NodeRecord,
+)
 from .topology import TopologyCoordinator
 
 
 FISH_STATE_INTERVAL_SECONDS = 0.1
 PEER_FISH_STATE_TTL_SECONDS = 0.5
+NODE_METRIC_INTERVAL_SECONDS = 10.0
+CONFIG_RECONCILE_INTERVAL_SECONDS = 2.0
 GHOST_EDGE_MARGIN_SCALE = 1.2
 TOPOLOGY_OFFSETS = {
     "left": (-1, 0),
@@ -63,6 +75,7 @@ class CyberFishApp:
         self._role_override = sanitize_role(role_override) if role_override is not None else None
         if self._role_override is not None:
             self.config.role = self._role_override
+        self._network_forced_off = force_network_enabled is False
         self._network_enabled = (
             self.config.network_enabled
             if force_network_enabled is None
@@ -75,6 +88,16 @@ class CyberFishApp:
         self.renderer: AquariumRenderer | None = None
         self.audio = AudioController(self.config.sound_enabled)
         self.network: NetworkManager | None = None
+        self.boot_id = str(uuid.uuid4())
+        self.db_settings = MySQLSettings.from_env()
+        self.storage: DatabaseService | None = None
+        self.active_config = ConfigSnapshot.from_config(self.config)
+        self._pending_config_request: str | None = None
+        self._last_metric_at = 0.0
+        self._last_config_reconcile_at = 0.0
+        self._last_topology_signature: tuple | None = None
+        self._pending_manual_topology_id: str | None = None
+        self._audited_config_versions: set[int] = set()
         self.topology = TopologyCoordinator(
             node_id=self.config.node_id,
             topology=self.config.topology,
@@ -107,6 +130,7 @@ class CyberFishApp:
         self.audio.start()
         self._reset_fishes()
         self._start_network()
+        self._start_storage_if_admin()
         self._render(0.0)
 
         self.running = True
@@ -120,6 +144,8 @@ class CyberFishApp:
                 dt = min(0.05, self.clock.tick(60) / 1000.0)
                 self._handle_events()
                 self._network_tick(now)
+                self._storage_tick(now)
+                self._metric_tick(now)
                 if not self.paused:
                     self._update_fishes(dt)
                 self._state_sync_tick(time.monotonic())
@@ -163,7 +189,7 @@ class CyberFishApp:
         raise last_error
 
     def _start_network(self) -> None:
-        if not self._network_enabled:
+        if self._network_forced_off:
             return
         try:
             self.network = NetworkManager(
@@ -172,6 +198,8 @@ class CyberFishApp:
                 broadcast_host=self.config.broadcast_host,
                 screen_size=self._bounds(),
                 role=self.effective_role,
+                boot_id=self.boot_id,
+                applied_config_version=self.config.managed_config_version,
             )
             self.network.send_node_join()
             self.network.send_hello()
@@ -183,6 +211,9 @@ class CyberFishApp:
 
     def _shutdown(self) -> None:
         self.audio.stop()
+        if self.storage:
+            self.storage.stop()
+            self.storage = None
         if self.network:
             self.network.close()
         self._save_config()
@@ -193,6 +224,204 @@ class CyberFishApp:
         if self._role_override is not None:
             config = replace(self.config, role=self._saved_config_role, admin_id=None)
         return save_config(self.config_path, config)
+
+    def _local_node_record(self) -> NodeRecord:
+        return NodeRecord(
+            node_id=self.config.node_id,
+            hostname=(self.network.hostname if self.network else socket.gethostname()),
+            role=self.effective_role,
+            ip_address=(self.network.local_ip if self.network else None),
+            udp_port=(self.network.listen_port if self.network else self.config.udp_port),
+            screen_size=self._bounds(),
+            boot_id=self.boot_id,
+            applied_config_version=self.config.managed_config_version,
+        )
+
+    def _start_storage_if_admin(self) -> None:
+        if (
+            not self.db_settings.enabled
+            or self.effective_role != ROLE_ADMIN
+            or self.storage is not None
+        ):
+            return
+        self.storage = DatabaseService(
+            self.db_settings,
+            self._local_node_record(),
+            ConfigSnapshot.from_config(self.config),
+        )
+        self.storage.start()
+        self.status_message = "MySQL 连接中，当前使用本地缓存配置"
+
+    def _storage_tick(self, now: float) -> None:
+        if not self.db_settings.enabled:
+            return
+        if self.effective_role != ROLE_ADMIN:
+            if self.storage:
+                self.storage.stop()
+                self.storage = None
+            return
+        self._start_storage_if_admin()
+        if not self.storage:
+            return
+        for result in self.storage.poll_results():
+            if result.kind in ("bootstrap", "config") and result.ok and result.snapshot:
+                self._pending_config_request = None
+                self._apply_config_snapshot(result.snapshot)
+                self.status_message = f"MySQL 配置 v{result.snapshot.version} 已应用"
+                self._broadcast_config_snapshot()
+                if result.kind == "config":
+                    command_id = f"config-{result.snapshot.version}"
+                    self.storage.record_command(
+                        {
+                            "command_id": command_id,
+                            "admin_node_id": self.config.node_id,
+                            "target_node_id": None,
+                            "action": "apply_config_snapshot",
+                            "payload": result.snapshot.to_dict(),
+                            "config_version": result.snapshot.version,
+                            "expected_results": len(self._peers()) + 1,
+                        }
+                    )
+                    self._audited_config_versions.add(result.snapshot.version)
+                    self.storage.record_command_result(
+                        {
+                            "command_id": command_id,
+                            "node_id": self.config.node_id,
+                            "ok": True,
+                            "message": "管理员已应用",
+                        }
+                    )
+            elif result.kind == "config" and not result.ok:
+                self._pending_config_request = None
+                self.status_message = f"配置未修改：{result.message}"[:120]
+            elif result.kind == "health" and not result.ok:
+                self.status_message = f"MySQL 不可用，使用缓存：{result.message}"[:120]
+            elif (
+                result.kind == "topology"
+                and result.ok
+                and result.request_id == self._pending_manual_topology_id
+            ):
+                self.config.manual_topology_version = result.request_id
+                self._pending_manual_topology_id = None
+                payload = self.active_config.to_dict()
+                payload["manual_topology_id"] = result.request_id
+                payload["topology"] = dict(self.config.topology)
+                payload["topologies"] = {
+                    **payload.get("topologies", {}),
+                    self.config.node_id: dict(self.config.topology),
+                }
+                self.active_config = ConfigSnapshot.from_dict(payload)
+                self._save_config()
+
+        if now - self._last_config_reconcile_at >= CONFIG_RECONCILE_INTERVAL_SECONDS:
+            self._last_config_reconcile_at = now
+            self.storage.record_node(self._local_node_record())
+            for peer in self._peers():
+                self.storage.record_node(self._peer_node_record(peer))
+                if peer.applied_config_version < self.active_config.version:
+                    self._send_config_snapshot(peer)
+
+    def _peer_node_record(self, peer: Peer) -> NodeRecord:
+        return NodeRecord(
+            node_id=peer.node_id,
+            hostname=peer.hostname,
+            role=peer.role,
+            ip_address=peer.address,
+            udp_port=peer.port,
+            screen_size=peer.screen_size,
+            boot_id=peer.boot_id or "",
+            applied_config_version=peer.applied_config_version,
+        )
+
+    def _request_managed_config_change(self, reason: str, **changes: object) -> bool:
+        if not self.db_settings.enabled:
+            return False
+        if not self.storage or not self.storage.healthy:
+            self.status_message = "MySQL 不可用，配置变更已拒绝"
+            return True
+        if self._pending_config_request:
+            self.status_message = "已有配置变更正在提交"
+            return True
+        candidate = self.active_config.with_changes(**changes)
+        request_id = self.storage.submit_config(candidate, reason)
+        if request_id is None:
+            self.status_message = "配置队列已满，变更未提交"
+            return True
+        self._pending_config_request = request_id
+        self.status_message = "配置正在提交 MySQL"
+        return True
+
+    def _apply_config_snapshot(self, snapshot: ConfigSnapshot) -> None:
+        snapshot = snapshot.normalized()
+        if snapshot.version < self.config.managed_config_version:
+            return
+        old_display = (
+            self.config.fullscreen,
+            self.config.display_index,
+            self.config.window_width,
+            self.config.window_height,
+        )
+        self._set_fish_count(snapshot.fish_count, persist=False)
+        self.config.managed_config_version = snapshot.version
+        self.config.speed_multiplier = snapshot.speed_multiplier
+        self.config.sound_enabled = snapshot.sound_enabled
+        self.config.network_enabled = snapshot.network_enabled
+        self._network_enabled = snapshot.network_enabled and not self._network_forced_off
+        self.config.auto_topology = snapshot.auto_topology
+        self.config.manual_topology_version = snapshot.manual_topology_id
+        self.config.fullscreen = snapshot.node.fullscreen
+        self.config.display_index = snapshot.node.display_index
+        self.config.window_width = snapshot.node.window_width
+        self.config.window_height = snapshot.node.window_height
+        self.topology.set_auto_mode(snapshot.auto_topology)
+        if not snapshot.auto_topology and snapshot.manual_topology_id:
+            self.config.topology.clear()
+            self.config.topology.update(snapshot.topology)
+        self.audio.set_enabled(snapshot.sound_enabled)
+        new_display = (
+            self.config.fullscreen,
+            self.config.display_index,
+            self.config.window_width,
+            self.config.window_height,
+        )
+        if self.screen is not None and old_display != new_display:
+            self.screen = self._create_screen()
+            if self.renderer:
+                self.renderer.resize(self.screen)
+            if self.network:
+                self.network.update_screen_size(self._bounds())
+        if self.network:
+            self.network.set_applied_config_version(snapshot.version)
+        self.active_config = snapshot
+        self._save_config()
+
+    def _send_config_snapshot(self, peer: Peer) -> None:
+        if not self.network or self.effective_role != ROLE_ADMIN:
+            return
+        payload = self.active_config.to_dict()
+        # 数据库中没有目标节点覆盖时，展示节点保留自己的显示设置缓存。
+        override = self.active_config.node_overrides.get(peer.node_id)
+        if override is None:
+            payload.pop("node", None)
+        else:
+            payload["node"] = override.to_dict()
+        payload.pop("topologies", None)
+        payload.pop("node_overrides", None)
+        if not self.active_config.auto_topology:
+            payload["topology"] = self.active_config.topologies.get(
+                peer.node_id,
+                {
+                    "left": peer.left_neighbor,
+                    "right": peer.right_neighbor,
+                    "up": peer.up_neighbor,
+                    "down": peer.down_neighbor,
+                },
+            )
+        self.network.send_config_snapshot(peer, payload)
+
+    def _broadcast_config_snapshot(self) -> None:
+        for peer in self._peers():
+            self._send_config_snapshot(peer)
 
     def _bounds(self) -> tuple[int, int]:
         if not self.screen:
@@ -286,6 +515,11 @@ class CyberFishApp:
             return
         if action.name == "toggle_network":
             target_enabled = not self._network_enabled
+            if self._request_managed_config_change(
+                "toggle network data plane",
+                network_enabled=target_enabled,
+            ):
+                return
             self._send_admin_command("set_network_enabled", {"enabled": target_enabled})
             self._set_network_enabled(target_enabled)
             return
@@ -299,8 +533,18 @@ class CyberFishApp:
         elif action.name == "quit":
             self.running = False
         elif action.name == "toggle_auto_topology":
+            if self._request_managed_config_change(
+                "toggle automatic topology",
+                auto_topology=not self.config.auto_topology,
+            ):
+                return
             self._toggle_auto_topology()
         elif action.name == "toggle_sound":
+            if self._request_managed_config_change(
+                "toggle sound",
+                sound_enabled=not self.config.sound_enabled,
+            ):
+                return
             self.config.sound_enabled = not self.config.sound_enabled
             self.audio.set_enabled(self.config.sound_enabled)
             self._save_config()
@@ -309,20 +553,45 @@ class CyberFishApp:
                 {"enabled": self.config.sound_enabled},
             )
         elif action.name == "toggle_fullscreen":
+            if self._request_managed_config_change(
+                "toggle fullscreen",
+                node={"fullscreen": not self.config.fullscreen},
+            ):
+                return
             self._toggle_fullscreen()
         elif action.name == "fish_inc":
+            if self._request_managed_config_change(
+                "increase fish count",
+                fish_count=min(200, self.config.fish_count + 1),
+            ):
+                return
             if self._change_fish_count(1):
                 self._send_admin_command("set_fish_count", {"fish_count": self.config.fish_count})
         elif action.name == "fish_dec":
+            if self._request_managed_config_change(
+                "decrease fish count",
+                fish_count=max(1, self.config.fish_count - 1),
+            ):
+                return
             if self._change_fish_count(-1):
                 self._send_admin_command("set_fish_count", {"fish_count": self.config.fish_count})
         elif action.name == "speed_inc":
+            if self._request_managed_config_change(
+                "increase speed",
+                speed_multiplier=min(4.0, round(self.config.speed_multiplier + 0.1, 1)),
+            ):
+                return
             if self._change_speed(0.1):
                 self._send_admin_command(
                     "set_speed",
                     {"speed_multiplier": self.config.speed_multiplier},
                 )
         elif action.name == "speed_dec":
+            if self._request_managed_config_change(
+                "decrease speed",
+                speed_multiplier=max(0.1, round(self.config.speed_multiplier - 0.1, 1)),
+            ):
+                return
             if self._change_speed(-0.1):
                 self._send_admin_command(
                     "set_speed",
@@ -375,13 +644,12 @@ class CyberFishApp:
         return True
 
     def _set_network_enabled(self, enabled: bool, *, persist: bool = True) -> None:
-        self._network_enabled = bool(enabled)
-        self.config.network_enabled = self._network_enabled
-        if self._network_enabled and not self.network:
+        # 该开关只控制鱼状态同步和跨屏数据面；发现、配置和指标管理通道保持在线，
+        # 否则关闭后管理员无法远程重新开启。
+        self.config.network_enabled = bool(enabled)
+        self._network_enabled = self.config.network_enabled and not self._network_forced_off
+        if not self._network_forced_off and not self.network:
             self._start_network()
-        elif not self._network_enabled and self.network:
-            self.network.close()
-            self.network = None
         if persist:
             self._save_config()
 
@@ -452,6 +720,17 @@ class CyberFishApp:
             self.status_message = "检测到相同 node_id 的主机，请修改 config.json 的 node_id"
         for ack in events.admin_acks:
             self._handle_admin_ack(ack)
+        for ack in events.config_acks:
+            self._handle_config_ack(ack)
+        for message in events.config_snapshots:
+            self._handle_config_snapshot(message)
+        for peer in events.discovered:
+            if self.storage:
+                self.storage.record_node(self._peer_node_record(peer))
+            if self.effective_role == ROLE_ADMIN and self.active_config.version > 0:
+                self._send_config_snapshot(peer)
+        for metric in events.node_metrics:
+            self._handle_node_metric(metric)
         for claim in events.topology_claims:
             self.topology.on_claim(claim)
         for command in events.admin_commands:
@@ -475,13 +754,130 @@ class CyberFishApp:
         self._update_role_state()
 
     def _state_sync_tick(self, now: float) -> None:
-        if not self.network:
+        if not self.network or not self.config.network_enabled:
             return
         if now - self._last_state_at < FISH_STATE_INTERVAL_SECONDS:
             return
         self.network.update_screen_size(self._bounds())
         self.network.send_fish_state(len(self.fishes), self._full_fish_state())
         self._last_state_at = now
+
+    def _metric_tick(self, now: float) -> None:
+        if not self.network or now - self._last_metric_at < NODE_METRIC_INTERVAL_SECONDS:
+            return
+        fps = self.clock.get_fps() if self.clock else 0.0
+        sequence = self.network.send_node_metrics(len(self.fishes), fps)
+        self._last_metric_at = now
+        if self.effective_role == ROLE_ADMIN and self.storage:
+            self.storage.record_metric(
+                MetricReport(
+                    node_id=self.config.node_id,
+                    boot_id=self.boot_id,
+                    sequence=sequence,
+                    fish_count=len(self.fishes),
+                    fps=fps,
+                    counters={
+                        key: int(self.network.stats.get(key, 0))
+                        for key in (
+                            "transfer_sent",
+                            "transfer_recv",
+                            "ack_recv",
+                            "transfer_expired",
+                            "datagrams_recv",
+                            "send_errors",
+                        )
+                    },
+                )
+            )
+
+    def _handle_node_metric(self, payload: dict) -> None:
+        if self.effective_role != ROLE_ADMIN or not self.storage:
+            return
+        try:
+            report = MetricReport.from_dict(payload)
+        except (TypeError, ValueError):
+            return
+        if report.node_id and report.node_id != self.config.node_id:
+            self.storage.record_metric(report)
+
+    def _handle_config_snapshot(self, message: dict) -> None:
+        if self.effective_role == ROLE_ADMIN:
+            return
+        sender = str(message.get("node_id") or "")
+        address = message.get("_address")
+        raw_config = message.get("config")
+        if not sender or sender != self.config.admin_id or not isinstance(raw_config, dict):
+            return
+        peer = self.network.get_peer(sender) if self.network else None
+        if peer is None or peer.role != ROLE_ADMIN:
+            return
+        payload = dict(raw_config)
+        payload.setdefault("node", NodeOverride.from_config(self.config).to_dict())
+        try:
+            snapshot = ConfigSnapshot.from_dict(payload)
+            self._apply_config_snapshot(snapshot)
+            ok = True
+            response = "配置已应用"
+        except (TypeError, ValueError) as exc:
+            snapshot = ConfigSnapshot.from_config(self.config)
+            ok = False
+            response = f"配置非法: {exc}"
+        if self.network and isinstance(address, tuple):
+            self.network.send_config_ack(
+                address,
+                sender,
+                snapshot.version,
+                ok=ok,
+                message=response,
+                node_config=NodeOverride.from_config(self.config).to_dict(),
+            )
+
+    def _handle_config_ack(self, ack: dict) -> None:
+        if self.effective_role != ROLE_ADMIN:
+            return
+        node_id = str(ack.get("node_id") or "")
+        try:
+            version = max(0, int(ack.get("config_version", 0)))
+        except (TypeError, ValueError):
+            return
+        peer = self.network.get_peer(node_id) if self.network else None
+        if peer and ack.get("ok"):
+            peer.applied_config_version = max(peer.applied_config_version, version)
+        raw_override = ack.get("node")
+        if (
+            self.storage
+            and node_id
+            and version == self.active_config.version
+            and ack.get("ok")
+            and isinstance(raw_override, dict)
+        ):
+            try:
+                override = ConfigSnapshot.from_dict(
+                    {**self.active_config.to_dict(), "node": raw_override}
+                ).node
+            except (TypeError, ValueError):
+                override = None
+            if override is not None:
+                if peer:
+                    self.storage.record_node(self._peer_node_record(peer))
+                self.storage.record_node_override(node_id, version, override)
+                payload = self.active_config.to_dict()
+                payload["node_overrides"] = {
+                    **payload.get("node_overrides", {}),
+                    node_id: override.to_dict(),
+                }
+                self.active_config = ConfigSnapshot.from_dict(payload)
+        prefix = "OK" if ack.get("ok") else "失败"
+        self.admin_ack_status[node_id] = f"{prefix}: 配置 v{version}"[:40]
+        if self.storage and node_id and version in self._audited_config_versions:
+            self.storage.record_command_result(
+                {
+                    "command_id": f"config-{version}",
+                    "node_id": node_id,
+                    "ok": bool(ack.get("ok")),
+                    "message": str(ack.get("message") or ""),
+                }
+            )
 
     def _update_role_state(self) -> None:
         admin_candidates = []
@@ -515,6 +911,29 @@ class CyberFishApp:
             return
         self.network.set_role(ROLE_ADMIN)
         command_id = self.network.send_admin_command(action, payload, target=target)
+        if self.storage:
+            for peer in self._peers():
+                self.storage.record_node(self._peer_node_record(peer))
+            self.storage.record_command(
+                {
+                    "command_id": command_id,
+                    "admin_node_id": self.config.node_id,
+                    "target_node_id": None if target == "all" else target,
+                    "action": action,
+                    "payload": payload or {},
+                    "config_version": self.config.managed_config_version or None,
+                    "expected_results": len(self._peers()) + 1 if target == "all" else 1,
+                }
+            )
+            if target == "all":
+                self.storage.record_command_result(
+                    {
+                        "command_id": command_id,
+                        "node_id": self.config.node_id,
+                        "ok": True,
+                        "message": "管理员本机已执行",
+                    }
+                )
         for peer in self._peers():
             self.admin_ack_status[peer.node_id] = f"{command_id[-6:]} 等待"
 
@@ -527,6 +946,15 @@ class CyberFishApp:
         prefix = "OK" if ack.get("ok") else "失败"
         message = str(ack.get("message") or "")
         self.admin_ack_status[node_id] = f"{prefix}: {message}"[:40]
+        if self.storage:
+            self.storage.record_command_result(
+                {
+                    "command_id": str(ack.get("command_id") or ""),
+                    "node_id": node_id,
+                    "ok": bool(ack.get("ok")),
+                    "message": message,
+                }
+            )
 
     def _handle_admin_command(self, command: dict) -> None:
         address = command.get("_address")
@@ -627,9 +1055,38 @@ class CyberFishApp:
         self.topology.update(online_ids, now=now)
         self._last_topology_at = now
         self._sync_peer_topology_snapshots()
+        self._persist_topology_if_stable(now)
         if self.debug_net and now - self._last_debug_log_at >= 2.0:
             self._last_debug_log_at = now
             print("[debug-net] " + " | ".join(self.network.debug_lines()), flush=True)
+
+    def _persist_topology_if_stable(self, now: float) -> None:
+        if not self.storage or not self.storage.healthy or not self.topology.is_converged(now):
+            return
+        edges = self._topology_edges()
+        mode = "auto" if self.config.auto_topology else "manual"
+        signature = (mode, tuple(sorted(edges)))
+        if signature == self._last_topology_signature:
+            return
+        for peer in self._peers():
+            self.storage.record_node(self._peer_node_record(peer))
+        topology_id = self.storage.record_topology(mode, True, edges)
+        if topology_id is None:
+            return
+        if mode == "manual":
+            self._pending_manual_topology_id = topology_id
+        self._last_topology_signature = signature
+
+    def _topology_edges(self) -> list[tuple[str, str, str]]:
+        edges: set[tuple[str, str, str]] = set()
+        for direction, target in self.config.topology.items():
+            if target:
+                edges.add((self.config.node_id, direction, target))
+        for peer_id, claim in self.topology.peer_claims.items():
+            for direction, target in claim.topology.items():
+                if target:
+                    edges.add((peer_id, direction, target))
+        return sorted(edges)
 
     def _sync_peer_topology_snapshots(self) -> None:
         if not self.network:

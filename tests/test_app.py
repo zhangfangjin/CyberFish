@@ -12,9 +12,26 @@ from cyberfish.config import ROLE_ADMIN, ROLE_DISPLAY_NODE, load_config
 from cyberfish.controls import ControlAction
 from cyberfish.fish import Fish
 from cyberfish.network import Peer
+from cyberfish.storage import ConfigSnapshot
 
 
 class AppDisplayTests(unittest.TestCase):
+    def test_managed_snapshot_updates_fish_population_before_caching(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = CyberFishApp(Path(temp_dir) / "config.json", force_network_enabled=False)
+            app.config.fish_count = 1
+            app.fishes = []
+            snapshot = ConfigSnapshot.from_config(app.config).with_changes(
+                config_version=2,
+                fish_count=3,
+            )
+
+            app._apply_config_snapshot(snapshot)
+
+            self.assertEqual(app.config.managed_config_version, 2)
+            self.assertEqual(app.config.fish_count, 3)
+            self.assertEqual(len(app.fishes), 3)
+
     def test_display_mode_falls_back_to_primary_display_on_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             app = CyberFishApp(Path(temp_dir) / "config.json", force_network_enabled=False)

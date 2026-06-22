@@ -10,12 +10,15 @@ from cyberfish.network import (
     DISCOVER,
     DISCOVER_RESPONSE,
     HEARTBEAT,
+    CONFIG_ACK,
+    CONFIG_SNAPSHOT,
     LEGACY_FISH_STATE,
     LEGACY_TOPOLOGY,
     NetworkEvents,
     NetworkManager,
     NODE_JOIN,
     NODE_LEAVE,
+    NODE_METRICS,
     Peer,
     STATUS_SYNC,
     TOPOLOGY_UPDATE,
@@ -59,6 +62,67 @@ def make_fake_manager(node_id: str = "node-b", clock: FakeClock | None = None) -
 
 
 class StandardProtocolTests(unittest.TestCase):
+    def test_config_and_metric_management_messages(self) -> None:
+        manager = make_fake_manager("node-a")
+        manager.boot_id = "boot-a"
+        manager.applied_config_version = 3
+        peer = Peer("node-b", "host-b", "127.0.0.1", 42000, (800, 600), 0.0)
+
+        manager.send_config_snapshot(peer, {"config_version": 3, "fish_count": 12})
+        sequence = manager.send_node_metrics(12, 59.8)
+
+        self.assertEqual(manager.sent_messages[0][0]["type"], CONFIG_SNAPSHOT)
+        self.assertEqual(manager.sent_messages[0][0]["target_node_id"], "node-b")
+        self.assertEqual(sequence, 1)
+        self.assertEqual(manager.broadcasted[0]["type"], NODE_METRICS)
+        self.assertEqual(manager.broadcasted[0]["boot_id"], "boot-a")
+        self.assertEqual(manager.broadcasted[0]["applied_config_version"], 3)
+
+    def test_inbound_config_snapshot_ack_and_metrics_create_events(self) -> None:
+        manager = make_fake_manager("node-b")
+        events = NetworkEvents()
+        messages = [
+            {
+                "type": CONFIG_SNAPSHOT,
+                "node_id": "node-a",
+                "role": ROLE_ADMIN,
+                "target_node_id": "node-b",
+                "config": {"config_version": 2},
+            },
+            {
+                "type": NODE_METRICS,
+                "node_id": "node-a",
+                "boot_id": "boot-a",
+                "sequence": 1,
+                "counters": {},
+            },
+        ]
+        for message in messages:
+            manager._handle_datagram(
+                json.dumps(message).encode("utf-8"),
+                ("127.0.0.1", 42000),
+                events,
+            )
+
+        self.assertEqual(len(events.config_snapshots), 1)
+        self.assertEqual(len(events.node_metrics), 1)
+
+        admin = make_fake_manager("node-a")
+        ack_events = NetworkEvents()
+        ack = {
+            "type": CONFIG_ACK,
+            "node_id": "node-b",
+            "target_node_id": "node-a",
+            "config_version": 2,
+            "ok": True,
+        }
+        admin._handle_datagram(
+            json.dumps(ack).encode("utf-8"),
+            ("127.0.0.1", 42000),
+            ack_events,
+        )
+        self.assertEqual(len(ack_events.config_acks), 1)
+
     def test_outbound_methods_use_standard_message_types(self) -> None:
         manager = make_fake_manager("node-a")
 
